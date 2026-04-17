@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "asi-stream-demo"
+version = "0.1.0"
+description = "ZWO ASI camera streaming stress-test (PyQt5 + direct ctypes SDK)"
+requires-python = ">=3.10"
+
+dependencies = [
+    "PyQt5>=5.15",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+fits = ["astropy>=5.0"]
+ws   = ["websockets>=12.0"]
+all  = ["astropy>=5.0", "websockets>=12.0"]
+
+[project.scripts]
+asi-stream-demo = "asi_stream_demo.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

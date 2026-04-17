@@ -6,6 +6,15 @@ __pycache__/
 # C extensions
 *.so
 
+# Images
+*.tif
+*.tiff
+*.bmp
+*.jpg
+*.jpeg
+*.fits
+*.fit
+
 # Distribution / packaging
 .Python
 build/
@@ -143,6 +152,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.conda
 
 # Spyder project settings
 .spyderproject
