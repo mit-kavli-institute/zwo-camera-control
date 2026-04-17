@@ -35,6 +35,7 @@ class ControlKind(Enum):
     INTEGER     = auto()  # integer in [min, max]
     EXPOSURE    = auto()  # integer µs; display as ms / s
     FRAME_RATE  = auto()  # integer fps limit (absent on CMOS; present on ASI990)
+    FLIP        = auto()  # 0=None, 1=Horizontal, 2=Vertical, 3=Both
     TEMPERATURE = auto()  # read-only; raw value is 10× actual °C
     READONLY    = auto()  # generic read-only
 
@@ -46,6 +47,7 @@ _KIND_BY_NAME: Dict[str, ControlKind] = {
     "TargetFPS":         ControlKind.FRAME_RATE,
     "FrameRate":         ControlKind.FRAME_RATE,
     "Temperature":       ControlKind.TEMPERATURE,
+    "Flip":              ControlKind.FLIP,
     "HighSpeedMode":     ControlKind.BOOLEAN,
     "CoolerOn":          ControlKind.BOOLEAN,
     "FanOn":             ControlKind.BOOLEAN,
@@ -55,8 +57,37 @@ _KIND_BY_NAME: Dict[str, ControlKind] = {
     "PatternAdjust":     ControlKind.BOOLEAN,
 }
 
+# Canonical renames applied at caps-parse time. Everything downstream
+# (GUI dict keys, WS API keys, FITS headers, snapshots) uses the new name.
+_NAME_RENAMES: Dict[str, str] = {
+    "Brightness": "Offset",
+}
+
+# Display-only labels that differ from the canonical name.
+_DISPLAY_NAME_OVERRIDES: Dict[str, str] = {
+    "BandWidth": "Turbo USB",
+}
+
+# Default values to apply on connect, overriding the SDK's DefaultValue.
+# Keys are post-rename canonical names. Clamped to the SDK-reported
+# [min, max] at spec-construction time.
+_DEFAULT_OVERRIDES: Dict[str, int] = {
+    "Gain":      200,
+    "BandWidth": 100,
+}
+
+FLIP_LABELS = ("None", "Horizontal", "Vertical", "Both")
+
 _FORCE_READONLY: set = {"Temperature"}
-_HIDDEN: set = {"Overclock"}
+_HIDDEN: set = {
+    "Overclock",
+    # Auto-exposure algorithm controls — only relevant when auto-exp is active
+    "AutoMaxGain", "AutoMaxExp", "AutoMaxBrightness",
+    "AutoExpMaxGain", "AutoExpMaxExp", "AutoExpTargetBrightness",
+    # "Shifts gain and exposure leaving brightness unchanged" — only useful for
+    # casual imaging; confusing for astronomy / lab characterization.
+    "ExposureGainShift", "ExpGainShift",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +108,8 @@ class ControlSpec:
 
     @property
     def display_name(self) -> str:
+        if self.name in _DISPLAY_NAME_OVERRIDES:
+            return _DISPLAY_NAME_OVERRIDES[self.name]
         return re.sub(r'([A-Z])', r' \1', self.name).strip()
 
     @property
@@ -88,6 +121,8 @@ class ControlSpec:
     def display_value(self, raw: int) -> str:
         if self.kind == ControlKind.BOOLEAN:
             return "ON" if raw else "OFF"
+        if self.kind == ControlKind.FLIP:
+            return FLIP_LABELS[raw] if 0 <= raw < len(FLIP_LABELS) else str(raw)
         if self.kind == ControlKind.TEMPERATURE:
             return f"{raw / 10:.1f} °C"
         if self.kind == ControlKind.EXPOSURE:
@@ -135,13 +170,22 @@ class ControlSpec:
             else:
                 kind = ControlKind.INTEGER
 
+        min_value = int(caps.get("MinValue", 0))
+        max_value = int(caps.get("MaxValue", 0))
+        sdk_default = int(caps.get("DefaultValue", 0))
+        override = _DEFAULT_OVERRIDES.get(name)
+        default_value = (
+            max(min_value, min(max_value, override)) if override is not None
+            else sdk_default
+        )
+
         return cls(
             name          = name,
             description   = caps.get("Description", ""),
             kind          = kind,
-            min_value     = int(caps.get("MinValue", 0)),
-            max_value     = int(caps.get("MaxValue", 0)),
-            default_value = int(caps.get("DefaultValue", 0)),
+            min_value     = min_value,
+            max_value     = max_value,
+            default_value = default_value,
             is_auto       = bool(caps.get("IsAutoSupported", False)),
             is_writable   = is_writable,
             control_type  = int(caps.get("ControlType", -1)),
@@ -156,7 +200,7 @@ _DISPLAY_ORDER = [
     "Gain",
     "Exposure",
     "FrameRateLimit", "TargetFPS", "FrameRate",
-    "Brightness",
+    "Offset",
     "BandWidth",
     "HighSpeedMode",
     "Flip",
@@ -204,7 +248,7 @@ class CameraControlSet:
         return self._sorted(s for s in self.specs.values() if s.is_readonly)
 
     def has_offset(self) -> bool:
-        return "Brightness" in self.specs
+        return "Offset" in self.specs
 
     def has_frame_rate_control(self) -> bool:
         return any(s.kind == ControlKind.FRAME_RATE for s in self.specs.values())
@@ -215,9 +259,10 @@ class CameraControlSet:
     @classmethod
     def from_caps_dict(cls, camera_name: str, raw_caps: dict) -> "CameraControlSet":
         specs = {}
-        for name, caps in raw_caps.items():
-            if name in _HIDDEN:
+        for sdk_name, caps in raw_caps.items():
+            if sdk_name in _HIDDEN:
                 continue
+            name = _NAME_RENAMES.get(sdk_name, sdk_name)
             specs[name] = ControlSpec.from_caps_dict(name, caps)
         return cls(camera_name=camera_name, specs=specs)
 

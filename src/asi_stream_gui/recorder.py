@@ -1,14 +1,15 @@
 """
-FITS cube writer.
+FITS writers.
 
-Saves an (N, H, W) data cube as a primary HDU with rich headers, plus a
-BINTABLE extension with per-frame timestamps and inter-frame deltas for
-timing-jitter analysis. I/O runs in a daemon thread so the GUI never blocks.
+save_fits_cube        -- single FITS file with an (N, H, W) primary HDU and a
+                         BINTABLE extension carrying per-frame timestamps.
+save_fits_individual  -- one FITS file per frame, named {basename}_NNNN.fits.
 
-Uses a QObject signal bridge to safely callback on the GUI thread (as opposed
-to QTimer.singleShot from a plain thread, which is unreliable on Windows).
+Both run I/O on a daemon thread so the GUI never blocks, and use a QObject
+signal bridge to deliver the completion callback on the GUI thread.
 """
 
+import os
 import threading
 
 import numpy as np
@@ -113,3 +114,59 @@ def save_fits_cube(path, cube, timestamps, metadata, on_done):
         bridge.done.emit(msg)
 
     threading.Thread(target=_worker, daemon=True, name="FITSSave").start()
+
+
+def save_fits_individual(directory, basename, cube, timestamps, metadata, on_done):
+    """
+    Write one FITS file per frame: {directory}/{basename}_NNNN.fits.
+
+    Each file gets the full `metadata` dict in its header plus per-frame
+    FRAME_IDX, TIMESTAMP (s since start), and DELTA_T (s since previous frame).
+    """
+    if not HAS_ASTROPY:
+        on_done("FITS save error: astropy not installed")
+        return
+
+    bridge = _DoneBridge()
+    bridge.done.connect(on_done)
+
+    def _worker():
+        try:
+            os.makedirs(directory, exist_ok=True)
+            ts_arr = np.array(timestamps, dtype=np.float64)
+            dt_arr = np.diff(ts_arr, prepend=0.0)
+            n = cube.shape[0]
+            width = max(4, len(str(max(n - 1, 0))))
+
+            written = 0
+            total_bytes = 0
+            for i in range(n):
+                hdr = pyfits.Header()
+                for k, v in metadata.items():
+                    hdr[k] = v
+                hdr["FRAME_ID"] = int(i)
+                hdr["TIMESTMP"] = float(ts_arr[i])
+                hdr["DELTA_T"] = float(dt_arr[i])
+                hdr["COMMENT"] = "ZWO ASI streaming demo — individual frame"
+
+                path = os.path.join(
+                    directory, f"{basename}_{i:0{width}d}.fits"
+                )
+                hdu = pyfits.PrimaryHDU(data=cube[i], header=hdr)
+                hdu.writeto(path, overwrite=True, output_verify="silentfix")
+                written += 1
+                total_bytes += cube[i].nbytes
+
+            mb = total_bytes / 1e6
+            elapsed = metadata.get("ELAPSED", 0)
+            fps = n / elapsed if elapsed > 0 else 0
+            msg = (
+                f"Saved {written} files -> {directory}  "
+                f"({mb:.1f} MB, {fps:.1f} fps)"
+            )
+        except Exception as exc:
+            msg = f"FITS save error: {exc}"
+
+        bridge.done.emit(msg)
+
+    threading.Thread(target=_worker, daemon=True, name="FITSSaveIndiv").start()

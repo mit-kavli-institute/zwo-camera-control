@@ -9,31 +9,46 @@ import numpy as np
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QImage, QMouseEvent, QPainter, QPen, QPixmap
-from PyQt5.QtWidgets import QLabel, QSizePolicy, QWidget
+from PyQt5.QtWidgets import (
+    QCheckBox, QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget,
+)
 
 
 # -- Histogram -----------------------------------------------------------------
 
-class HistogramWidget(QWidget):
-    """Log-scaled histogram with dashed lines showing current stretch bounds."""
+class _HistogramPlot(QWidget):
+    """Histogram bars with fixed x-axis (set by data dtype) and stretch markers."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumHeight(100)
-        self.setMaximumHeight(150)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setMinimumHeight(70)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._bins = None
         self._edges = None
         self._z1 = 0.0
         self._z2 = 255.0
-        self._dmin = 0.0
-        self._dmax = 255.0
+        self._xmin = 0.0
+        self._xmax = 256.0    # histogram range (exclusive upper edge for integer data)
+        self._use_log = True
+
+    def set_log(self, use_log):
+        self._use_log = bool(use_log)
+        self.update()
 
     def update_data(self, data, z1, z2):
-        flat = data.ravel().astype(np.float64)
-        nbins = max(64, min(512, int(flat.max() - flat.min() + 1)))
-        self._bins, self._edges = np.histogram(flat, bins=nbins)
-        self._dmin, self._dmax = float(flat.min()), float(flat.max())
+        # Fix x-axis to the full dtype range so the plot doesn't rescale per frame.
+        if data.dtype == np.uint8:
+            xmin, xmax, nbins = 0, 256, 256        # one bin per value
+        elif data.dtype == np.uint16:
+            xmin, xmax, nbins = 0, 65536, 1024     # 64 values per bin
+        else:
+            xmin = float(data.min())
+            xmax = float(data.max()) + 1
+            nbins = 512
+
+        flat = data.ravel()
+        self._bins, self._edges = np.histogram(flat, bins=nbins, range=(xmin, xmax))
+        self._xmin, self._xmax = xmin, xmax
         self._z1, self._z2 = z1, z2
         self.update()
 
@@ -43,42 +58,106 @@ class HistogramWidget(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         W, H = self.width(), self.height()
-        ml, mb = 4, 18
-        pw, ph = W - ml - 4, H - mb - 4
+        ml, mb = 4, 14
+        pw, ph = W - ml - 4, H - mb - 2
         p.fillRect(self.rect(), QColor("#111"))
 
         if pw < 10 or ph < 10:
             p.end()
             return
 
-        log_b = np.log1p(self._bins.astype(np.float64))
-        peak = log_b.max() if log_b.max() > 0 else 1.0
-        n = len(log_b)
-        data_range = (self._edges[-1] - self._edges[0]) or 1.0
+        counts = self._bins.astype(np.float64)
+        yvals = np.log1p(counts) if self._use_log else counts
+        peak = yvals.max() if yvals.max() > 0 else 1.0
+        n = len(yvals)
+        data_range = (self._xmax - self._xmin) or 1.0
 
-        bar_w = max(1, int(pw / n))
         for i in range(n):
-            bar_h = int(log_b[i] / peak * ph)
-            x = ml + int((self._edges[i] - self._edges[0]) / data_range * pw)
+            bar_h = int(yvals[i] / peak * ph)
+            if bar_h <= 0:
+                continue
+            x_left = ml + int((self._edges[i] - self._xmin) / data_range * pw)
+            x_right = ml + int((self._edges[i + 1] - self._xmin) / data_range * pw)
+            bar_w = max(1, x_right - x_left)
             y = H - mb - bar_h
             mid = (self._edges[i] + self._edges[i + 1]) / 2
             in_range = self._z1 <= mid <= self._z2
             color = QColor("#00e87a") if in_range else QColor("#1a3a1a")
-            p.fillRect(x, y, bar_w, bar_h, color)
+            p.fillRect(x_left, y, bar_w, bar_h, color)
 
         pen = QPen(QColor("#ff4444"), 1, Qt.DashLine)
         p.setPen(pen)
         for zv in (self._z1, self._z2):
             xv = ml + max(0, min(
-                int((zv - self._edges[0]) / data_range * pw), pw
+                int((zv - self._xmin) / data_range * pw), pw
             ))
             p.drawLine(xv, 2, xv, H - mb)
 
         p.setPen(QColor("#666"))
         p.setFont(QFont("Courier New", 7))
-        p.drawText(ml, H - 2, f"{self._dmin:.0f}")
-        p.drawText(W - 60, H - 2, f"{self._dmax:.0f}")
+        p.drawText(ml, H - 2, f"{int(self._xmin)}")
+        xmax_txt = f"{int(self._xmax) - 1}"
+        p.drawText(W - 4 - 6 * len(xmax_txt), H - 2, xmax_txt)
         p.end()
+
+
+class HistogramWidget(QWidget):
+    """Panel: pixel histogram + mean/median/std/var stats + log-y toggle."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(120)
+        self.setMaximumHeight(180)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(6, 2, 6, 0)
+        top.setSpacing(14)
+
+        self._mean_lbl = QLabel("mean —")
+        self._median_lbl = QLabel("med —")
+        self._std_lbl = QLabel("std —")
+        self._var_lbl = QLabel("var —")
+        for lbl in (self._mean_lbl, self._median_lbl, self._std_lbl, self._var_lbl):
+            lbl.setStyleSheet("color: #aaa; font: 9pt 'Courier New';")
+            lbl.setMinimumWidth(95)
+            top.addWidget(lbl)
+        top.addStretch()
+
+        self._log_chk = QCheckBox("log y")
+        self._log_chk.setChecked(True)
+        self._log_chk.setStyleSheet("color: #888; font: 9pt 'Courier New';")
+        self._log_chk.toggled.connect(self._on_log_toggled)
+        top.addWidget(self._log_chk)
+
+        outer.addLayout(top)
+
+        self._plot = _HistogramPlot()
+        outer.addWidget(self._plot, stretch=1)
+
+    def update_data(self, data, z1, z2):
+        flat = data.ravel()
+        mean = float(flat.mean())
+        var = float(flat.var())
+        std = var ** 0.5
+        # Median via subsample when the frame is large — np.median sorts the full
+        # array, which dominates update cost on multi-MP frames.
+        sample = flat[::max(1, flat.size // 100_000)]
+        median = float(np.median(sample))
+
+        self._mean_lbl.setText(f"mean {mean:.1f}")
+        self._median_lbl.setText(f"med  {median:.0f}")
+        self._std_lbl.setText(f"std  {std:.2f}")
+        self._var_lbl.setText(f"var  {var:.1f}")
+
+        self._plot.update_data(data, z1, z2)
+
+    def _on_log_toggled(self, checked):
+        self._plot.set_log(checked)
 
 
 # -- Image display -------------------------------------------------------------

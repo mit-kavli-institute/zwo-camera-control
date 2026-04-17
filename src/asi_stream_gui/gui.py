@@ -28,17 +28,20 @@ from PyQt5.QtWidgets import (
 
 from .sdk import ASICamera, ASIDriver, ASIError, CameraInfo, Ctrl, ImgType
 from .camera_config import (
-    CameraControlSet, CameraSettings, ControlKind, ControlSpec,
+    CameraControlSet, CameraSettings, ControlKind, ControlSpec, FLIP_LABELS,
 )
 from .stretch import STRETCH_FUNCS
 from .capture import CaptureWorker
-from .recorder import save_fits_cube, HAS_ASTROPY
+from .recorder import save_fits_cube, save_fits_individual, HAS_ASTROPY
 from .widgets import HistogramWidget, ImageDisplay
 
 log = logging.getLogger("asi_demo.gui")
 
 # Maximum slider range before we switch to a spinbox.
 _SLIDER_MAX_RANGE = 4096
+
+# Exposure unit choices: (label, µs-per-unit)
+_EXP_UNITS = [("µs", 1), ("ms", 1_000), ("s", 1_000_000)]
 
 
 # =====================================================================
@@ -61,6 +64,8 @@ class ControlWidget(QWidget):
         self.on_change = on_change
         self._value_lbl = None
         self._input = None  # the slider, spinbox, or checkbox
+        self._exp_unit_combo = None  # only set for EXPOSURE controls
+        self._raw_exp_us = 0         # tracks raw µs for EXPOSURE controls
         self._build()
 
     def _build(self):
@@ -74,13 +79,13 @@ class ControlWidget(QWidget):
         hdr.setContentsMargins(0, 0, 0, 0)
 
         unit = ""
-        if s.kind == ControlKind.EXPOSURE:
-            unit = " (us)"
-        elif s.kind == ControlKind.FRAME_RATE:
+        if s.kind == ControlKind.FRAME_RATE:
             unit = " (fps)"
 
         lbl = QLabel(s.display_name + unit)
         lbl.setStyleSheet("color: #888; font: 9pt 'Courier New';")
+        if s.description:
+            self.setToolTip(s.description)
         hdr.addWidget(lbl)
         hdr.addStretch()
 
@@ -93,6 +98,22 @@ class ControlWidget(QWidget):
             layout.addLayout(hdr)
             return
 
+        if s.kind == ControlKind.FLIP:
+            combo = QComboBox()
+            for label in FLIP_LABELS:
+                combo.addItem(label)
+            idx = s.default_value if 0 <= s.default_value < len(FLIP_LABELS) else 0
+            combo.setCurrentIndex(idx)
+            combo.setStyleSheet(
+                "color: #00e87a; font: bold 9pt 'Courier New'; "
+                "background: #1a1a1a; border: 1px solid #333;"
+            )
+            combo.currentIndexChanged.connect(lambda _: self._fire())
+            hdr.addWidget(combo)
+            self._input = combo
+            layout.addLayout(hdr)
+            return
+
         if s.kind in (ControlKind.TEMPERATURE, ControlKind.READONLY):
             val = QLabel(s.display_value(s.default_value))
             val.setStyleSheet("color: #555; font: bold 9pt 'Courier New';")
@@ -102,29 +123,95 @@ class ControlWidget(QWidget):
             layout.addLayout(hdr)
             return
 
-        # Numeric: show value label in header
-        val = QLabel(s.display_value(s.default_value))
-        val.setStyleSheet("color: #00e87a; font: bold 9pt 'Courier New';")
-        val.setFixedWidth(90)
-        val.setAlignment(Qt.AlignRight)
-        hdr.addWidget(val)
-        self._value_lbl = val
-        layout.addLayout(hdr)
+        if s.kind == ControlKind.EXPOSURE:
+            default_idx = (
+                2 if s.default_value >= 1_000_000 else
+                1 if s.default_value >= 1_000 else 0
+            )
+            unit_combo = QComboBox()
+            for uname, _ in _EXP_UNITS:
+                unit_combo.addItem(uname)
+            unit_combo.setCurrentIndex(default_idx)
+            unit_combo.setFixedWidth(48)
+            unit_combo.setStyleSheet("color: #888; font: 9pt 'Courier New';")
+
+            exp_spin = QDoubleSpinBox()
+            exp_spin.setDecimals(3)
+            exp_spin.setStyleSheet(
+                "color: #00e87a; font: bold 9pt 'Courier New'; "
+                "background: #1a1a1a; border: 1px solid #333;"
+            )
+
+            m0 = _EXP_UNITS[default_idx][1]
+            exp_spin.setRange(s.min_value / m0, s.max_value / m0)
+            self._raw_exp_us = s.default_value
+            exp_spin.setValue(s.default_value / m0)
+
+            self._exp_unit_combo = unit_combo
+
+            def _on_unit_changed(idx):
+                m = _EXP_UNITS[idx][1]
+                exp_spin.blockSignals(True)
+                exp_spin.setRange(s.min_value / m, s.max_value / m)
+                exp_spin.setValue(self._raw_exp_us / m)
+                exp_spin.blockSignals(False)
+
+            def _on_spin_changed():
+                m = _EXP_UNITS[self._exp_unit_combo.currentIndex()][1]
+                self._raw_exp_us = self.spec.clamp(round(exp_spin.value() * m))
+                self._fire()
+
+            unit_combo.currentIndexChanged.connect(_on_unit_changed)
+            exp_spin.valueChanged.connect(lambda _: _on_spin_changed())
+
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(4)
+            row.addWidget(exp_spin, stretch=1)
+            row.addWidget(unit_combo)
+
+            layout.addLayout(hdr)
+            layout.addLayout(row)
+            self._input = exp_spin
+            return
 
         rng = s.max_value - s.min_value
         use_slider = (
             rng <= _SLIDER_MAX_RANGE
-            and s.kind not in (ControlKind.EXPOSURE, ControlKind.FRAME_RATE)
+            and s.kind not in (ControlKind.FRAME_RATE,)
         )
 
         if use_slider:
+            # Spinbox in header for typed input, synced bidirectionally with slider
+            val_spin = QSpinBox()
+            val_spin.setRange(s.min_value, s.max_value)
+            val_spin.setValue(s.default_value)
+            val_spin.setFixedWidth(70)
+            val_spin.setButtonSymbols(QSpinBox.NoButtons)
+            val_spin.setStyleSheet(
+                "color: #00e87a; font: bold 9pt 'Courier New'; "
+                "background: #1a1a1a; border: 1px solid #333;"
+            )
+            hdr.addWidget(val_spin)
+            layout.addLayout(hdr)
+
             slider = QSlider(Qt.Horizontal)
             slider.setRange(s.min_value, s.max_value)
             slider.setValue(s.default_value)
+            slider.valueChanged.connect(val_spin.setValue)
+            val_spin.valueChanged.connect(slider.setValue)
             slider.valueChanged.connect(lambda _: self._fire())
             layout.addWidget(slider)
             self._input = slider
         else:
+            val = QLabel(s.display_value(s.default_value))
+            val.setStyleSheet("color: #00e87a; font: bold 9pt 'Courier New';")
+            val.setFixedWidth(90)
+            val.setAlignment(Qt.AlignRight)
+            hdr.addWidget(val)
+            self._value_lbl = val
+            layout.addLayout(hdr)
+
             spin = QSpinBox()
             spin.setRange(s.min_value, s.max_value)
             spin.setValue(s.default_value)
@@ -143,6 +230,10 @@ class ControlWidget(QWidget):
     def get_value(self) -> int:
         if isinstance(self._input, QCheckBox):
             return 1 if self._input.isChecked() else 0
+        if isinstance(self._input, QDoubleSpinBox):
+            return self._raw_exp_us
+        if isinstance(self._input, QComboBox):
+            return self.spec.clamp(self._input.currentIndex())
         if isinstance(self._input, QSlider):
             return self.spec.clamp(self._input.value())
         if isinstance(self._input, QSpinBox):
@@ -153,6 +244,13 @@ class ControlWidget(QWidget):
         v = self.spec.clamp(v)
         if isinstance(self._input, QCheckBox):
             self._input.setChecked(bool(v))
+        elif isinstance(self._input, QDoubleSpinBox):
+            self._raw_exp_us = v
+            idx = self._exp_unit_combo.currentIndex()
+            m = _EXP_UNITS[idx][1]
+            self._input.setValue(v / m)
+        elif isinstance(self._input, QComboBox):
+            self._input.setCurrentIndex(v)
         elif isinstance(self._input, (QSlider, QSpinBox)):
             self._input.setValue(v)
 
@@ -664,7 +762,10 @@ class MainWindow(QMainWindow):
         self._reset_rec_button()
         self._rec_lbl.setText("SAVING...")
 
-        path = self._fits_path.text()
+        directory = self._fits_dir.text().strip() or os.getcwd()
+        basename = self._fits_basename.text().strip() or "capture"
+        stack_mode = self._mode_stack_rb.isChecked()
+
         cam = self._camera
         actual_fps = cube.shape[0] / elapsed if elapsed > 0 else 0
 
@@ -701,10 +802,22 @@ class MainWindow(QMainWindow):
                 self._ws_record_done_cb(msg)
                 self._ws_record_done_cb = None
 
-        save_fits_cube(path, cube, timestamps, meta, _after_save)
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError as e:
+            _after_save(f"FITS save error: cannot create {directory}: {e}")
+            return
+
+        if stack_mode:
+            path = os.path.join(directory, f"{basename}.fits")
+            save_fits_cube(path, cube, timestamps, meta, _after_save)
+        else:
+            save_fits_individual(
+                directory, basename, cube, timestamps, meta, _after_save
+            )
 
     def _reset_rec_button(self):
-        self._rec_btn.setText("⬤  Record FITS Cube")
+        self._rec_btn.setText("⬤  Record FITS")
         self._rec_btn.setStyleSheet("background-color: #3a1a2a;")
         try:
             self._rec_btn.clicked.disconnect()
@@ -741,6 +854,51 @@ class MainWindow(QMainWindow):
             if self._settings:
                 result["controls"] = self._settings.snapshot()
             return result
+
+        elif action == "list_cameras":
+            if not self._driver:
+                return {"cmd": "list_cameras", "cameras": [],
+                        "error": "SDK not loaded"}
+            cams = []
+            try:
+                n = self._driver.get_num_cameras()
+                for i in range(n):
+                    info = CameraInfo.from_struct(
+                        self._driver.get_camera_property(i)
+                    )
+                    cams.append({"index": i, "name": info.name})
+            except (ASIError, Exception) as e:
+                return {"cmd": "list_cameras", "cameras": [], "error": str(e)}
+            return {"cmd": "list_cameras", "cameras": cams}
+
+        elif action == "connect_camera":
+            if self._camera is not None:
+                return {"cmd": "connect_camera", "ok": True,
+                        "camera": self._camera.info.name,
+                        "note": "already connected"}
+            idx = cmd.get("index", 0)
+            # Refresh the combo so the selection round-trips cleanly to the GUI.
+            self._refresh_cameras()
+            for i in range(self._cam_combo.count()):
+                if self._cam_combo.itemData(i) == idx:
+                    self._cam_combo.setCurrentIndex(i)
+                    break
+            else:
+                return {"cmd": "connect_camera", "ok": False,
+                        "error": f"no camera with index {idx}"}
+            self._connect()
+            ok = self._camera is not None
+            return {
+                "cmd": "connect_camera", "ok": ok,
+                "camera": self._camera.info.name if ok else None,
+            }
+
+        elif action == "disconnect_camera":
+            if self._camera is None:
+                return {"cmd": "disconnect_camera", "ok": True,
+                        "note": "not connected"}
+            self._disconnect()
+            return {"cmd": "disconnect_camera", "ok": True}
 
         elif action == "set":
             if self._settings:
@@ -780,12 +938,36 @@ class MainWindow(QMainWindow):
 
         elif action == "record":
             n = cmd.get("n_frames", 100)
-            path = cmd.get("path", "cube.fits")
             self._nframes_spin.setValue(n)
-            self._fits_path.setText(path)
+
+            # Backward-compat: `path` sets directory+basename in one shot.
+            if "path" in cmd:
+                p = cmd["path"]
+                d, f = os.path.split(p)
+                if d:
+                    self._fits_dir.setText(d)
+                base, _ext = os.path.splitext(f)
+                if base:
+                    self._fits_basename.setText(base)
+
+            if "directory" in cmd:
+                self._fits_dir.setText(str(cmd["directory"]))
+            if "basename" in cmd:
+                self._fits_basename.setText(str(cmd["basename"]))
+
+            mode = cmd.get("mode", "stack").lower()
+            if mode == "individual":
+                self._mode_indiv_rb.setChecked(True)
+            else:
+                self._mode_stack_rb.setChecked(True)
+
             self._start_record()
             return {
-                "cmd": "record", "ack": True, "n_frames": n, "path": path,
+                "cmd": "record", "ack": True,
+                "n_frames": n,
+                "directory": self._fits_dir.text(),
+                "basename": self._fits_basename.text(),
+                "mode": "stack" if self._mode_stack_rb.isChecked() else "individual",
             }
 
         elif action == "cooler":
@@ -835,7 +1017,7 @@ class MainWindow(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setFixedWidth(285)
+        scroll.setFixedWidth(380)
 
         sidebar = QWidget()
         sidebar.setStyleSheet("background-color: #111;")
@@ -955,16 +1137,40 @@ class MainWindow(QMainWindow):
         gl.addLayout(
             self._spin_row("Frames", 1, 100000, 100, 10, 0, "_nframes_spin", True)
         )
+
+        # Directory picker
+        dir_lbl = QLabel("Directory")
+        dir_lbl.setStyleSheet("color: #888; font: 9pt 'Courier New';")
+        gl.addWidget(dir_lbl)
         row = QHBoxLayout()
-        self._fits_path = QLineEdit("cube.fits")
-        row.addWidget(self._fits_path)
+        self._fits_dir = QLineEdit(os.getcwd())
+        row.addWidget(self._fits_dir)
         btn = QPushButton("...")
         btn.setFixedWidth(30)
-        btn.clicked.connect(self._pick_fits_path)
+        btn.clicked.connect(self._pick_fits_dir)
         row.addWidget(btn)
         gl.addLayout(row)
 
-        self._rec_btn = QPushButton("⬤  Record FITS Cube")
+        # Basename
+        name_lbl = QLabel("Filename (no ext.)")
+        name_lbl.setStyleSheet("color: #888; font: 9pt 'Courier New';")
+        gl.addWidget(name_lbl)
+        self._fits_basename = QLineEdit("capture")
+        gl.addWidget(self._fits_basename)
+
+        # Mode: stack to cube (default) vs individual files
+        mode_row = QHBoxLayout()
+        self._mode_stack_rb = QRadioButton("Stack (cube)")
+        self._mode_indiv_rb = QRadioButton("Individual")
+        self._mode_stack_rb.setChecked(True)
+        mode_group = QButtonGroup(self)
+        mode_group.addButton(self._mode_stack_rb)
+        mode_group.addButton(self._mode_indiv_rb)
+        mode_row.addWidget(self._mode_stack_rb)
+        mode_row.addWidget(self._mode_indiv_rb)
+        gl.addLayout(mode_row)
+
+        self._rec_btn = QPushButton("⬤  Record FITS")
         self._rec_btn.setStyleSheet("background-color: #3a1a2a;")
         self._rec_btn.clicked.connect(self._start_record)
         gl.addWidget(self._rec_btn)
@@ -1092,13 +1298,13 @@ class MainWindow(QMainWindow):
         self._roi_x.setValue(0)
         self._roi_y.setValue(0)
 
-    def _pick_fits_path(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save FITS cube", self._fits_path.text(),
-            "FITS (*.fits *.fit);;All (*)",
+    def _pick_fits_dir(self):
+        current = self._fits_dir.text().strip() or os.getcwd()
+        path = QFileDialog.getExistingDirectory(
+            self, "Select output directory", current,
         )
         if path:
-            self._fits_path.setText(path)
+            self._fits_dir.setText(path)
 
     # =====================================================================
     #  Cleanup

@@ -9,10 +9,20 @@ Protocol
 All messages are JSON objects with a "cmd" key:
 
     {"cmd": "status"}
-    {"cmd": "set", "exposure_ms": 50.0, "gain": 200, ...}
+    {"cmd": "list_cameras"}
+    {"cmd": "connect_camera", "index": 0}
+    {"cmd": "disconnect_camera"}
+    {"cmd": "set", "Exposure": 50000, "Gain": 200, ...}
     {"cmd": "start_stream"}  /  {"cmd": "stop_stream"}
-    {"cmd": "record", "n_frames": 100, "path": "cube.fits"}
+    {"cmd": "record", "n_frames": 100,
+                      "directory": "D:/data",
+                      "basename": "capture",
+                      "mode": "stack"}       # or "individual"
     {"cmd": "cooler", "on": true, "target": -10}
+
+For "record", the server sends two messages:
+  1. Immediate ack with the final directory/basename/mode.
+  2. A {"cmd": "record_done", "message": ...} when the FITS save finishes.
 
 Example client::
 
