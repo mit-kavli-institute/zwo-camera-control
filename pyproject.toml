@@ -3,7 +3,7 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "asi-stream-demo"
+name = "zwo-camera-gui"
 version = "0.1.0"
 description = "ZWO ASI camera streaming stress-test (PyQt5 + direct ctypes SDK)"
 requires-python = ">=3.10"
@@ -18,7 +18,7 @@ dependencies = [
 
 
 [project.scripts]
-asi-stream-demo = "asi_stream_gui.__main__:main"
+zwo-camera-gui = "zwo_camera_gui.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

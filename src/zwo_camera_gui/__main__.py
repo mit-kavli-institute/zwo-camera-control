@@ -1,5 +1,5 @@
 """
-Entry point: python -m asi_stream_demo [--sdk PATH] [--ws-port PORT]
+Entry point: python -m zwo_camera_gui [--sdk PATH] [--ws-port PORT]
 """
 
 import argparse

@@ -1,4 +1,4 @@
-# ASI Stream Demo
+# ZWO Camera GUI
 
 ZWO ASI camera streaming stress-test. Direct ctypes wrapper around
 `ASICamera2.dll` — no third-party `zwoasi` dependency.
@@ -32,11 +32,11 @@ place it on PATH or pass `--sdk /path/to/ASICamera2.dll`.
 
 ```bash
 # as installed console script
-asi-stream-demo --sdk C:\path\to\ASICamera2.dll
+zwo-camera-gui --sdk C:\path\to\ASICamera2.dll
 
 # as module
-python -m asi_stream_demo --sdk C:\path\to\ASICamera2.dll
+python -m zwo_camera_gui --sdk C:\path\to\ASICamera2.dll
 
 # with WebSocket command server
-asi-stream-demo --sdk ASICamera2.dll --ws-port 8765
+zwo-camera-gui --sdk ASICamera2.dll --ws-port 8765
 ```

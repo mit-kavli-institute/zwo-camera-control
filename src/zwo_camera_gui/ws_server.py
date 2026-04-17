@@ -17,7 +17,12 @@ All messages are JSON objects with a "cmd" key:
     {"cmd": "record", "n_frames": 100,
                       "directory": "D:/data",
                       "basename": "capture",
-                      "mode": "stack"}       # or "individual"
+                      "mode": "stack",       # or "individual"
+                      "obstype": "LIGHT",    # optional; sets OBSTYPE header
+                      "extra_headers": [     # optional; [[key, val, comment|null], ...]
+                          ["FILTER", "Halpha", "narrowband"],
+                          ["OBJECT", "M42", null]
+                      ]}
     {"cmd": "cooler", "on": true, "target": -10}
 
 For "record", the server sends two messages:

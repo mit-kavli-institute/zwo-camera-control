@@ -1,8 +1,8 @@
 """
 FITS writers.
 
-save_fits_cube        -- single FITS file with an (N, H, W) primary HDU and a
-                         BINTABLE extension carrying per-frame timestamps.
+save_fits_cube        -- single FITS file with the (N, H, W) cube in the
+                         primary HDU and all metadata in its header.
 save_fits_individual  -- one FITS file per frame, named {basename}_NNNN.fits.
 
 Both run I/O on a daemon thread so the GUI never blocks, and use a QObject
@@ -28,9 +28,19 @@ class _DoneBridge(QObject):
     done = pyqtSignal(str)
 
 
-def save_fits_cube(path, cube, timestamps, metadata, on_done):
+def _scalar(v) -> float:
+    """Unwrap a possibly (value, comment) header entry to just the value."""
+    if isinstance(v, tuple) and len(v) == 2:
+        return float(v[0])
+    return float(v)
+
+
+def save_fits_cube(path, cube, metadata, on_done):
     """
     Write a FITS cube to disk in a background thread.
+
+    The cube is saved as a single-HDU FITS image: a PrimaryHDU holding
+    the (N, H, W) data with all camera/run metadata in its header.
 
     Parameters
     ----------
@@ -38,10 +48,8 @@ def save_fits_cube(path, cube, timestamps, metadata, on_done):
         Output file path.
     cube : np.ndarray
         (N, H, W) data cube.
-    timestamps : list[float]
-        Per-frame times in seconds since recording start.
     metadata : dict
-        FITS header keywords.
+        FITS header keywords (camera controls, ROI, elapsed, fps, ...).
     on_done : callable(str)
         Callback with status message, called on the Qt GUI thread.
     """
@@ -59,48 +67,17 @@ def save_fits_cube(path, cube, timestamps, metadata, on_done):
             hdr = pyfits.Header()
             for k, v in metadata.items():
                 hdr[k] = v
+            hdr["BUNIT"] = "ADU"
+            elapsed = _scalar(metadata.get("ELAPSED", 0))
             hdr["COMMENT"] = "ZWO ASI streaming demo cube"
             hdr["COMMENT"] = (
-                f"Recorded {cube.shape[0]} frames in "
-                f"{metadata.get('ELAPSED', 0):.3f}s"
+                f"Recorded {cube.shape[0]} frames in {elapsed:.3f}s"
             )
 
             primary = pyfits.PrimaryHDU(data=cube, header=hdr)
-
-            # Per-frame timing table with index, timestamp, and delta-t
-            ts_arr = np.array(timestamps, dtype=np.float64)
-            dt_arr = np.diff(ts_arr, prepend=0.0)
-
-            cols = [
-                pyfits.Column(
-                    name="FRAME_IDX", format="J",
-                    array=np.arange(cube.shape[0], dtype=np.int32),
-                ),
-                pyfits.Column(
-                    name="TIMESTAMP", format="D",
-                    array=ts_arr, unit="s",
-                ),
-                pyfits.Column(
-                    name="DELTA_T", format="D",
-                    array=dt_arr, unit="s",
-                ),
-            ]
-            timing_hdu = pyfits.BinTableHDU.from_columns(
-                cols, name="FRAME_TIMING"
-            )
-            timing_hdu.header["COMMENT"] = (
-                "TIMESTAMP = seconds since recording start "
-                "(time.perf_counter)"
-            )
-            timing_hdu.header["COMMENT"] = (
-                "DELTA_T = inter-frame interval; useful for jitter analysis"
-            )
-
-            hdul = pyfits.HDUList([primary, timing_hdu])
-            hdul.writeto(path, overwrite=True, output_verify='silentfix')
+            primary.writeto(path, overwrite=True, output_verify='silentfix')
 
             mb = cube.nbytes / 1e6
-            elapsed = metadata.get("ELAPSED", 0)
             fps = cube.shape[0] / elapsed if elapsed > 0 else 0
             msg = (
                 f"Saved {cube.shape[0]} frames -> {path}  "
@@ -144,9 +121,9 @@ def save_fits_individual(directory, basename, cube, timestamps, metadata, on_don
                 hdr = pyfits.Header()
                 for k, v in metadata.items():
                     hdr[k] = v
-                hdr["FRAME_ID"] = int(i)
-                hdr["TIMESTMP"] = float(ts_arr[i])
-                hdr["DELTA_T"] = float(dt_arr[i])
+                hdr["FRAME_ID"] = (int(i), "frame index within the series")
+                hdr["TIMESTMP"] = (float(ts_arr[i]), "[s] since recording start")
+                hdr["DELTA_T"] = (float(dt_arr[i]), "[s] since previous frame")
                 hdr["COMMENT"] = "ZWO ASI streaming demo — individual frame"
 
                 path = os.path.join(
@@ -158,7 +135,7 @@ def save_fits_individual(directory, basename, cube, timestamps, metadata, on_don
                 total_bytes += cube[i].nbytes
 
             mb = total_bytes / 1e6
-            elapsed = metadata.get("ELAPSED", 0)
+            elapsed = _scalar(metadata.get("ELAPSED", 0))
             fps = n / elapsed if elapsed > 0 else 0
             msg = (
                 f"Saved {written} files -> {directory}  "

@@ -3,11 +3,11 @@ Synchronous Python client for the GUI's WebSocket command server.
 
 Launch the GUI with a port::
 
-    python -m asi_stream_gui --ws-port 8765
+    python -m zwo_camera_gui --ws-port 8765
 
 Then from any other Python process::
 
-    from asi_stream_gui.client import ASIClient
+    from zwo_camera_gui.client import ASIClient
 
     with ASIClient("ws://localhost:8765") as cam:
         cam.set(Exposure=50_000, Gain=200)
@@ -24,13 +24,62 @@ from __future__ import annotations
 
 import json
 from contextlib import AbstractContextManager
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 from websockets.sync.client import connect as _ws_connect
 
 
 class ASIClientError(RuntimeError):
     """Raised when the GUI reports an error or a record save fails."""
+
+
+# Accepted shapes for `extra_headers`:
+#   dict: {"KEY": value} or {"KEY": (value, "comment")}
+#   iterable of:
+#     - (key, value)
+#     - (key, value, comment)
+#     - astropy.io.fits.Card (or anything with .keyword/.value/.comment)
+HeaderLike = Union[
+    Dict[str, Any],
+    Iterable[Any],
+]
+
+
+def _normalize_headers(headers: HeaderLike) -> List[List[Any]]:
+    """Normalize flexible header input into [[key, value, comment|None], ...]
+    — a JSON-safe form the WS server can hand straight to astropy."""
+    if headers is None:
+        return []
+
+    out: List[List[Any]] = []
+
+    if isinstance(headers, dict):
+        for k, v in headers.items():
+            if isinstance(v, tuple) and len(v) == 2:
+                out.append([str(k), v[0], v[1]])
+            else:
+                out.append([str(k), v, None])
+        return out
+
+    for item in headers:
+        # Duck-type astropy Card
+        if hasattr(item, "keyword") and hasattr(item, "value"):
+            cmt = getattr(item, "comment", "") or None
+            out.append([str(item.keyword), item.value, cmt])
+            continue
+        if isinstance(item, (tuple, list)):
+            if len(item) == 2:
+                out.append([str(item[0]), item[1], None])
+            elif len(item) == 3:
+                out.append([str(item[0]), item[1], item[2]])
+            else:
+                raise ValueError(
+                    f"header tuple must be (key, val) or (key, val, comment), "
+                    f"got {item!r}"
+                )
+            continue
+        raise TypeError(f"unrecognized header item: {item!r}")
+    return out
 
 
 class ASIClient(AbstractContextManager):
@@ -119,6 +168,8 @@ class ASIClient(AbstractContextManager):
         directory: Optional[str] = None,
         basename: Optional[str] = None,
         mode: str = "stack",
+        obstype: Optional[str] = None,
+        extra_headers: Optional[HeaderLike] = None,
         timeout: float = 600.0,
     ) -> Dict[str, Any]:
         """
@@ -134,6 +185,14 @@ class ASIClient(AbstractContextManager):
             File basename (no extension). Defaults to the GUI's current setting.
         mode : {"stack", "individual"}
             "stack" -> one cube FITS; "individual" -> one file per frame.
+        obstype : str, optional
+            Value for the OBSTYPE header keyword, e.g. "LIGHT", "DARK", "FLAT".
+        extra_headers : dict | iterable, optional
+            Additional FITS header entries. Accepts:
+              - dict: ``{"KEY": value}`` or ``{"KEY": (value, "comment")}``
+              - iterable of ``(key, value)`` / ``(key, value, comment)``
+              - iterable of ``astropy.io.fits.Card`` objects
+            Applied *after* the auto-filled metadata, so these win on collision.
 
         Returns
         -------
@@ -154,6 +213,10 @@ class ASIClient(AbstractContextManager):
             cmd["directory"] = directory
         if basename is not None:
             cmd["basename"] = basename
+        if obstype is not None:
+            cmd["obstype"] = str(obstype)
+        if extra_headers is not None:
+            cmd["extra_headers"] = _normalize_headers(extra_headers)
 
         ack = self._send(cmd)  # immediate ack
         done = self._recv(timeout=timeout)  # record_done from save thread
@@ -172,6 +235,8 @@ class ASIClient(AbstractContextManager):
         directory: Optional[str] = None,
         basename: Optional[str] = None,
         stack: bool = True,
+        obstype: Optional[str] = None,
+        extra_headers: Optional[HeaderLike] = None,
         timeout: float = 600.0,
     ) -> Dict[str, Any]:
         """
@@ -181,6 +246,8 @@ class ASIClient(AbstractContextManager):
         exit so the next call doesn't pay the stream-startup cost and a human
         watching the GUI keeps their live preview. Call `stop_stream()`
         yourself when you're done.
+
+        See `record()` for `obstype` and `extra_headers`.
         """
         if not self.status().get("streaming", False):
             self.start_stream()
@@ -189,6 +256,8 @@ class ASIClient(AbstractContextManager):
             directory=directory,
             basename=basename,
             mode="stack" if stack else "individual",
+            obstype=obstype,
+            extra_headers=extra_headers,
             timeout=timeout,
         )
 

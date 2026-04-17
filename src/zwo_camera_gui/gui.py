@@ -286,6 +286,11 @@ class MainWindow(QMainWindow):
         # WebSocket recording callback (set by ws_server during record cmd)
         self._ws_record_done_cb = None
 
+        # Optional per-record header extras (set by WS record cmd, consumed
+        # in _on_recording_done, cleared after).
+        self._next_record_obstype = None
+        self._next_record_extras = []
+
         self._build_ui()
         self._init_sdk(sdk_path)
 
@@ -754,6 +759,8 @@ class MainWindow(QMainWindow):
         self._reset_rec_button()
         self._rec_progress.setValue(0)
         self._rec_lbl.setText("")
+        self._next_record_obstype = None
+        self._next_record_extras = []
         self._set_status("Recording cancelled")
 
     @pyqtSlot(object, object, float)
@@ -772,16 +779,26 @@ class MainWindow(QMainWindow):
         meta = {
             "INSTRUME": cam.info.name if cam else "ZWO ASI",
             "NFRAMES": cube.shape[0],
-            "STRMFPS": round(actual_fps, 3),
-            "ELAPSED": round(elapsed, 4),
+            "STRMFPS": (round(actual_fps, 3), "measured stream rate [fps]"),
+            "ELAPSED": (round(elapsed, 4), "total acquisition time [s]"),
             "DEPTH": "RAW16" if self._raw16_rb.isChecked() else "RAW8",
             "STRETCH": self._stretch_combo.currentText(),
         }
-        # Include all current control values in FITS header
+        if self._next_record_obstype:
+            meta["OBSTYPE"] = self._next_record_obstype
+
+        # Include all current control values in FITS header.
+        # Exposure is written separately as EXPTIME (in ms) below.
         if self._settings:
             snap = self._settings.snapshot()
             for k, v in snap.items():
+                if k == "Exposure":
+                    continue
                 meta[k[:8].upper()] = v
+            if "Exposure" in snap:
+                meta["EXPTIME"] = (
+                    snap["Exposure"] / 1000.0, "[ms] exposure time"
+                )
         if cam:
             w, h, _b, _t = cam.get_roi()
             meta["ROI_W"] = w
@@ -790,9 +807,19 @@ class MainWindow(QMainWindow):
             meta["ROI_Y"] = self._roi_y.value()
             if cam.info.is_cooler:
                 try:
-                    meta["DETTEMP"] = cam.temperature()
+                    meta["DETTEMP"] = (cam.temperature(), "[C] sensor temperature")
                 except ASIError:
                     pass
+
+        # Extras from WS client: list of [key, value, comment_or_null].
+        # Applied last so the user can override any of the above.
+        for extra in (self._next_record_extras or []):
+            key = extra[0]
+            val = extra[1]
+            cmt = extra[2] if len(extra) > 2 else None
+            meta[key] = (val, cmt) if cmt else val
+        self._next_record_obstype = None
+        self._next_record_extras = []
 
         def _after_save(msg):
             self._set_status(msg)
@@ -810,7 +837,7 @@ class MainWindow(QMainWindow):
 
         if stack_mode:
             path = os.path.join(directory, f"{basename}.fits")
-            save_fits_cube(path, cube, timestamps, meta, _after_save)
+            save_fits_cube(path, cube, meta, _after_save)
         else:
             save_fits_individual(
                 directory, basename, cube, timestamps, meta, _after_save
@@ -960,6 +987,9 @@ class MainWindow(QMainWindow):
                 self._mode_indiv_rb.setChecked(True)
             else:
                 self._mode_stack_rb.setChecked(True)
+
+            self._next_record_obstype = cmd.get("obstype") or None
+            self._next_record_extras = list(cmd.get("extra_headers") or [])
 
             self._start_record()
             return {
