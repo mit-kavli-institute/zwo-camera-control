@@ -14,7 +14,7 @@ from .gui import MainWindow
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ZWO ASI streaming demo (PyQt5 + direct ctypes)"
+        description="ASI/QHY streaming demo (PyQt5 + direct ctypes)"
     )
     parser.add_argument(
         "--sdk", metavar="PATH",
@@ -28,6 +28,14 @@ def main():
         "--verbose", "-v", action="store_true",
         help="Enable debug logging",
     )
+    parser.add_argument(
+        "--backend", choices=["asi", "qhy"], default="asi",
+        help="Camera backend to use",
+    )
+    parser.add_argument(
+        "--qhy-sdk", metavar="PATH",
+        help="Path to qhyccd SDK library (optional if qcam can auto-locate)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -38,7 +46,12 @@ def main():
     app = QApplication(sys.argv)
     app.setStyleSheet(DARK_STYLE)
 
-    win = MainWindow(sdk_path=args.sdk, ws_port=args.ws_port)
+    win = MainWindow(
+        sdk_path=args.sdk,
+        ws_port=args.ws_port,
+        backend=args.backend,
+        qhy_sdk_path=args.qhy_sdk,
+    )
     win.show()
     sys.exit(app.exec_())
 

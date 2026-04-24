@@ -32,6 +32,11 @@ from .camera_config import (
 )
 from .stretch import STRETCH_FUNCS
 from .capture import CaptureWorker
+from .qhy_capture import QHYCaptureWorker
+from .qhy import (
+    QHY42Camera, QHYCtrl, QHYError, QHYImgType,
+    enumerate_qhy_cameras, qcam_available,
+)
 from .recorder import save_fits_cube, save_fits_individual, HAS_ASTROPY
 from .widgets import HistogramWidget, ImageDisplay
 
@@ -265,12 +270,14 @@ class ControlWidget(QWidget):
 
 class MainWindow(QMainWindow):
 
-    def __init__(self, sdk_path=None, ws_port=0):
+    def __init__(self, sdk_path=None, ws_port=0, backend="asi", qhy_sdk_path=None):
         super().__init__()
-        self.setWindowTitle("ZWO ASI Streaming Demo")
+        self.setWindowTitle("ASI/QHY Streaming Demo")
         self.setMinimumSize(950, 620)
         self.resize(1200, 750)
 
+        self._backend = (backend or "asi").lower()
+        self._qhy_sdk_path = qhy_sdk_path
         self._driver = None
         self._camera = None
         self._worker = None
@@ -285,6 +292,11 @@ class MainWindow(QMainWindow):
 
         # WebSocket recording callback (set by ws_server during record cmd)
         self._ws_record_done_cb = None
+
+        # Raw enumeration result, refreshed by _refresh_cameras. Backend-neutral
+        # [{"index": int, "name": str}, ...] consumed by the WS list_cameras
+        # handler so the payload doesn't carry combo-box formatting.
+        self._cam_list: list = []
 
         # Optional per-record header extras (set by WS record cmd, consumed
         # in _on_recording_done, cleared after).
@@ -316,6 +328,15 @@ class MainWindow(QMainWindow):
     # =====================================================================
 
     def _init_sdk(self, path=None):
+        if self._backend == "qhy":
+            if path:
+                self._qhy_sdk_path = path
+            if self._qhy_sdk_path:
+                self._set_status(f"QHY SDK path set: {self._qhy_sdk_path}")
+            else:
+                self._set_status("QHY backend selected; SDK path is optional if qcam can locate qhyccd")
+            return
+
         candidates = []
         if path:
             candidates.append(path)
@@ -339,37 +360,86 @@ class MainWindow(QMainWindow):
         )
 
     def _browse_sdk(self):
+        title = (
+            "Select qhyccd library" if self._backend == "qhy"
+            else "Select ASICamera2.dll or libASICamera2.so"
+        )
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select ASICamera2.dll or libASICamera2.so", "",
+            self, title, "",
             "SDK library (*.dll *.so *.dylib);;All files (*)",
         )
         if not path:
             return
         try:
-            self._driver = ASIDriver(path)
+            if self._backend == "qhy":
+                self._qhy_sdk_path = path
+            else:
+                self._driver = ASIDriver(path)
             self._set_status(f"SDK loaded: {path}")
         except Exception as e:
             QMessageBox.critical(self, "SDK Error", str(e))
+
+    def _on_backend_changed(self, *_):
+        new_backend = self._backend_combo.currentData()
+        if new_backend == self._backend:
+            return
+        if self._camera is not None:
+            self._disconnect()
+        self._backend = new_backend
+        if self._backend == "asi":
+            self._driver = None
+            self._init_sdk()
+        else:
+            self._driver = None
+            self._init_sdk(self._qhy_sdk_path)
+        self._refresh_cameras()
 
     # =====================================================================
     #  Camera connection
     # =====================================================================
 
     def _refresh_cameras(self):
+        self._cam_combo.clear()
+        self._cam_list = []
+
+        if self._backend == "qhy":
+            if not qcam_available():
+                self._set_status(
+                    "qcam package not installed -- pip install the QHY Python wrapper"
+                )
+                return
+            try:
+                cams = enumerate_qhy_cameras(self._qhy_sdk_path)
+            except Exception as e:
+                self._set_status(f"QHY enumerate failed: {e}")
+                return
+            if not cams:
+                self._set_status("No QHY cameras found")
+                return
+            for c in cams:
+                self._cam_list.append({"index": c["index"], "name": c["name"]})
+                self._cam_combo.addItem(f"{c['index']}: {c['name']}", c["index"])
+            self._set_status(f"Found {len(cams)} QHY camera(s)")
+            return
+
         if not self._driver:
             self._set_status("Load SDK first")
             return
         n = self._driver.get_num_cameras()
-        self._cam_combo.clear()
         if n == 0:
             self._set_status("No cameras found")
             return
         for i in range(n):
             info = CameraInfo.from_struct(self._driver.get_camera_property(i))
+            self._cam_list.append({"index": i, "name": info.name})
             self._cam_combo.addItem(f"{i}: {info.name}", i)
         self._set_status(f"Found {n} camera(s)")
 
     def _connect(self):
+        if self._backend == "qhy":
+            self._connect_qhy()
+            return
+
         if not self._driver:
             QMessageBox.warning(self, "No SDK", "Load the SDK first.")
             return
@@ -443,6 +513,71 @@ class MainWindow(QMainWindow):
             self._settings = None
             QMessageBox.critical(self, "Connect Error", str(e))
 
+    def _connect_qhy(self):
+        idx = self._cam_combo.currentData()
+        if idx is None:
+            QMessageBox.warning(
+                self, "No camera", "Click Refresh, then select a camera."
+            )
+            return
+        try:
+            self._camera = QHY42Camera(
+                dll_path=self._qhy_sdk_path,
+                camera_index=int(idx),
+            )
+            self._camera.open()
+            cam = self._camera
+
+            caps_dict = cam.get_caps_dict()
+            self._control_set = CameraControlSet.from_caps_dict(
+                cam.info.name, caps_dict
+            )
+            self._settings = CameraSettings(self._control_set)
+            log.info("\n%s", self._control_set.describe())
+
+            self._rebuild_controls_panel()
+            self._apply_settings(silent=True)
+
+            self._roi_w.setMaximum(cam.info.max_width)
+            self._roi_h.setMaximum(cam.info.max_height)
+            self._roi_x.setMaximum(cam.info.max_width - 8)
+            self._roi_y.setMaximum(cam.info.max_height - 2)
+            self._roi_w.setValue(cam.info.max_width)
+            self._roi_h.setValue(cam.info.max_height)
+            self._roi_x.setValue(0)
+            self._roi_y.setValue(0)
+
+            self._cooler_group.setVisible(self._control_set.has_cooler())
+            if self._control_set.has_cooler():
+                self._cooler_timer.start(2000)
+                spec = self._control_set.get("TargetTemp")
+                if spec:
+                    self._cooler_temp.setRange(spec.min_value, spec.max_value)
+                    self._cooler_temp.setValue(spec.default_value)
+
+            flags = []
+            if self._control_set.has_cooler():
+                flags.append("cooled")
+            if self._control_set.has_offset():
+                flags.append("offset")
+            self._set_status(
+                f"Connected: {cam.info.name}  |  "
+                f"{cam.info.max_width}x{cam.info.max_height}  |  "
+                f"{cam.info.bit_depth}-bit  |  "
+                f"USB3={'yes' if cam.info.is_usb3 else 'no'}  |  "
+                + "  ".join(flags)
+            )
+            self._connect_btn.setText("Disconnect")
+            self._connect_btn.setStyleSheet("background-color: #5a1414;")
+            self._connect_btn.clicked.disconnect()
+            self._connect_btn.clicked.connect(self._disconnect)
+
+        except (QHYError, Exception) as e:
+            self._camera = None
+            self._control_set = None
+            self._settings = None
+            QMessageBox.critical(self, "Connect Error", str(e))
+
     def _disconnect(self):
         self._stop_stream()
         self._cooler_timer.stop()
@@ -452,6 +587,7 @@ class MainWindow(QMainWindow):
         self._control_set = None
         self._settings = None
         self._clear_controls_panel()
+        self._last_raw_frame = None
         self._connect_btn.setText("Connect")
         self._connect_btn.setStyleSheet("background-color: #1a3a1a;")
         self._connect_btn.clicked.disconnect()
@@ -526,9 +662,15 @@ class MainWindow(QMainWindow):
                         pass
 
             # Set ROI / image format
-            img_type = (
-                ImgType.RAW16 if self._raw16_rb.isChecked() else ImgType.RAW8
-            )
+            if self._backend == "qhy":
+                img_type = (
+                    QHYImgType.RAW16 if self._raw16_rb.isChecked()
+                    else QHYImgType.RAW8
+                )
+            else:
+                img_type = (
+                    ImgType.RAW16 if self._raw16_rb.isChecked() else ImgType.RAW8
+                )
             cam.set_roi(
                 self._roi_w.value(), self._roi_h.value(),
                 1, img_type,
@@ -562,7 +704,7 @@ class MainWindow(QMainWindow):
 
     def _apply_cooler(self):
         cam = self._camera
-        if not cam or not cam.info.is_cooler:
+        if not cam or not getattr(cam.info, "is_cooler", False):
             return
         try:
             cam.set_cooler(
@@ -573,23 +715,26 @@ class MainWindow(QMainWindow):
             self._set_status(
                 f"Cooler {state}, target={self._cooler_temp.value()} C"
             )
-        except ASIError as e:
+        except Exception as e:
             self._set_status(f"Cooler error: {e}")
 
     def _update_cooler_readout(self):
         cam = self._camera
-        if not cam or not cam.info.is_cooler:
+        if not cam or not getattr(cam.info, "is_cooler", False):
             return
         try:
             temp = cam.temperature()
-            power = (
-                cam.get_ctrl_value(Ctrl.COOLER_POWER_PERC)
-                if cam.has_ctrl(Ctrl.COOLER_POWER_PERC) else 0
-            )
-            self._cooler_readout.setText(
-                f"Sensor: {temp:.1f} C   Power: {power}%"
-            )
-        except ASIError:
+            if self._backend == "qhy":
+                self._cooler_readout.setText(f"Sensor: {temp:.1f} C")
+            else:
+                power = (
+                    cam.get_ctrl_value(Ctrl.COOLER_POWER_PERC)
+                    if cam.has_ctrl(Ctrl.COOLER_POWER_PERC) else 0
+                )
+                self._cooler_readout.setText(
+                    f"Sensor: {temp:.1f} C   Power: {power}%"
+                )
+        except Exception:
             pass
 
     # =====================================================================
@@ -606,7 +751,8 @@ class MainWindow(QMainWindow):
         exp_us = self._settings.get("Exposure") if self._settings else 100_000
         exp_ms = (exp_us or 100_000) / 1000.0
 
-        self._worker = CaptureWorker(cam, exp_ms)
+        worker_cls = QHYCaptureWorker if self._backend == "qhy" else CaptureWorker
+        self._worker = worker_cls(cam, exp_ms)
         self._worker_thread = QThread()
         self._worker.moveToThread(self._worker_thread)
 
@@ -715,7 +861,7 @@ class MainWindow(QMainWindow):
                     try:
                         val = self._camera.get_ctrl_value(spec.control_type)
                         w.update_readonly(val)
-                    except (ASIError, Exception):
+                    except Exception:
                         pass
 
     @pyqtSlot(int, int)
@@ -808,7 +954,7 @@ class MainWindow(QMainWindow):
             if cam.info.is_cooler:
                 try:
                     meta["DETTEMP"] = (cam.temperature(), "[C] sensor temperature")
-                except ASIError:
+                except Exception:
                     pass
 
         # Extras from WS client: list of [key, value, comment_or_null].
@@ -874,6 +1020,7 @@ class MainWindow(QMainWindow):
             cam = self._camera
             result = {
                 "cmd": "status",
+                "backend": self._backend,
                 "connected": cam is not None,
                 "streaming": self._streaming,
                 "camera": cam.info.name if cam else None,
@@ -882,28 +1029,52 @@ class MainWindow(QMainWindow):
                 result["controls"] = self._settings.snapshot()
             return result
 
+        elif action == "backend":
+            # Query or switch the active camera backend.
+            requested = cmd.get("backend")
+            if requested is None:
+                return {"cmd": "backend", "backend": self._backend}
+            requested = str(requested).lower()
+            if requested not in ("asi", "qhy"):
+                return {"cmd": "backend", "ok": False,
+                        "error": f"unknown backend: {requested!r}"}
+            if requested != self._backend:
+                # Mirror _on_backend_changed: disconnect, swap, reinit, refresh.
+                if self._camera is not None:
+                    self._disconnect()
+                self._backend = requested
+                self._driver = None
+                self._init_sdk(self._qhy_sdk_path if requested == "qhy" else None)
+                # Keep the sidebar combo in sync so the GUI reflects the switch.
+                idx = 1 if requested == "qhy" else 0
+                self._backend_combo.blockSignals(True)
+                self._backend_combo.setCurrentIndex(idx)
+                self._backend_combo.blockSignals(False)
+                self._refresh_cameras()
+            return {"cmd": "backend", "ok": True, "backend": self._backend}
+
         elif action == "list_cameras":
-            if not self._driver:
-                return {"cmd": "list_cameras", "cameras": [],
-                        "error": "SDK not loaded"}
-            cams = []
+            # Delegate to the same enumeration the GUI dropdown uses so the
+            # two agree regardless of backend.
             try:
-                n = self._driver.get_num_cameras()
-                for i in range(n):
-                    info = CameraInfo.from_struct(
-                        self._driver.get_camera_property(i)
-                    )
-                    cams.append({"index": i, "name": info.name})
+                self._refresh_cameras()
             except (ASIError, Exception) as e:
                 return {"cmd": "list_cameras", "cameras": [], "error": str(e)}
-            return {"cmd": "list_cameras", "cameras": cams}
+            if self._backend == "asi" and not self._driver:
+                return {"cmd": "list_cameras", "cameras": [],
+                        "error": "SDK not loaded"}
+            return {
+                "cmd": "list_cameras",
+                "backend": self._backend,
+                "cameras": list(self._cam_list),
+            }
 
         elif action == "connect_camera":
             if self._camera is not None:
                 return {"cmd": "connect_camera", "ok": True,
                         "camera": self._camera.info.name,
                         "note": "already connected"}
-            idx = cmd.get("index", 0)
+            idx = int(cmd.get("index", 0))
             # Refresh the combo so the selection round-trips cleanly to the GUI.
             self._refresh_cameras()
             for i in range(self._cam_combo.count()):
@@ -1069,7 +1240,7 @@ class MainWindow(QMainWindow):
 
     def _build_sidebar(self, sb):
         # Title
-        title = QLabel("ASI STREAM\nDEMO")
+        title = QLabel("CAMERA STREAM\nDEMO")
         title.setStyleSheet("color: #00e87a; font: bold 15pt 'Courier New';")
         title.setAlignment(Qt.AlignCenter)
         sb.addWidget(title)
@@ -1078,6 +1249,16 @@ class MainWindow(QMainWindow):
         # == Camera ==
         grp = QGroupBox("CAMERA")
         gl = QVBoxLayout(grp)
+        backend_row = QHBoxLayout()
+        backend_row.addWidget(QLabel("Backend"))
+        self._backend_combo = QComboBox()
+        self._backend_combo.addItem("ASI", "asi")
+        self._backend_combo.addItem("QHY42", "qhy")
+        self._backend_combo.setCurrentIndex(1 if self._backend == "qhy" else 0)
+        self._backend_combo.currentIndexChanged.connect(self._on_backend_changed)
+        backend_row.addWidget(self._backend_combo)
+        gl.addLayout(backend_row)
+
         self._cam_combo = QComboBox()
         gl.addWidget(self._cam_combo)
         row = QHBoxLayout()

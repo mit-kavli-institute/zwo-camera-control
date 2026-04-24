@@ -6,9 +6,14 @@ to the Qt GUI thread via a signal bridge (thread-safe).
 
 Protocol
 --------
-All messages are JSON objects with a "cmd" key:
+All messages are JSON objects with a "cmd" key. The same protocol drives
+both ASI and QHY backends -- clients treat the server identically. The
+``status`` and ``list_cameras`` replies include a ``"backend"`` field
+("asi" or "qhy") so a client can tell which camera type is active.
 
     {"cmd": "status"}
+    {"cmd": "backend"}                       # query active backend
+    {"cmd": "backend", "backend": "qhy"}     # switch backend at runtime
     {"cmd": "list_cameras"}
     {"cmd": "connect_camera", "index": 0}
     {"cmd": "disconnect_camera"}

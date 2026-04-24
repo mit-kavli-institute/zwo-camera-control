@@ -173,11 +173,15 @@ class ControlSpec:
         min_value = int(caps.get("MinValue", 0))
         max_value = int(caps.get("MaxValue", 0))
         sdk_default = int(caps.get("DefaultValue", 0))
+        # Only apply the override when it fits this camera's reported range.
+        # Falling back to the SDK default (rather than clamping) keeps cameras
+        # with narrower ranges -- e.g. QHY42 Gain [0, 100] -- from being pinned
+        # at their maximum by an override tuned for a different model.
         override = _DEFAULT_OVERRIDES.get(name)
-        default_value = (
-            max(min_value, min(max_value, override)) if override is not None
-            else sdk_default
-        )
+        if override is not None and min_value <= override <= max_value:
+            default_value = override
+        else:
+            default_value = sdk_default
 
         return cls(
             name          = name,

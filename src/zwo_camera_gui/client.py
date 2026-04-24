@@ -1,19 +1,27 @@
 """
 Synchronous Python client for the GUI's WebSocket command server.
 
+Works identically against either camera backend (ZWO ASI or QHY42). The
+backend is reported by ``status()`` and can be switched at runtime with
+``set_backend()``.
+
 Launch the GUI with a port::
 
     python -m zwo_camera_gui --ws-port 8765
 
 Then from any other Python process::
 
-    from zwo_camera_gui.client import ASIClient
+    from zwo_camera_gui.client import CameraClient
 
-    with ASIClient("ws://localhost:8765") as cam:
-        cam.set(Exposure=50_000, Gain=200)
+    with CameraClient("ws://localhost:8765") as cam:
+        cam.set_backend("qhy")          # optional -- picks ASI or QHY
+        cam.connect_camera(0)
+        cam.set(Exposure=50_000, Gain=30)
         cam.start_stream()
         cam.record(20, directory="./captures", basename="demo")
         cam.stop_stream()
+
+``ASIClient`` is kept as an alias of ``CameraClient`` for backward compat.
 
 The client owns one persistent connection and serializes JSON on/off the wire.
 All methods are blocking; `record` waits for the background FITS save to finish
@@ -29,8 +37,12 @@ from typing import Any, Dict, Iterable, List, Optional, Union
 from websockets.sync.client import connect as _ws_connect
 
 
-class ASIClientError(RuntimeError):
+class CameraClientError(RuntimeError):
     """Raised when the GUI reports an error or a record save fails."""
+
+
+# Backward-compat alias.
+ASIClientError = CameraClientError
 
 
 # Accepted shapes for `extra_headers`:
@@ -82,8 +94,12 @@ def _normalize_headers(headers: HeaderLike) -> List[List[Any]]:
     return out
 
 
-class ASIClient(AbstractContextManager):
-    """Blocking client over the GUI's JSON-WebSocket protocol."""
+class CameraClient(AbstractContextManager):
+    """Blocking client over the GUI's JSON-WebSocket protocol.
+
+    Backend-neutral: works against either the ASI or QHY backend. Use
+    ``backend()`` to query and ``set_backend()`` to switch at runtime.
+    """
 
     def __init__(self, url: str = "ws://localhost:8765", timeout: float = 5.0):
         self._url = url
@@ -92,7 +108,7 @@ class ASIClient(AbstractContextManager):
 
     # -- lifecycle -------------------------------------------------------
 
-    def connect(self) -> "ASIClient":
+    def connect(self) -> "CameraClient":
         if self._ws is None:
             self._ws = _ws_connect(self._url, open_timeout=self._timeout)
         return self
@@ -102,7 +118,7 @@ class ASIClient(AbstractContextManager):
             self._ws.close()
             self._ws = None
 
-    def __enter__(self) -> "ASIClient":
+    def __enter__(self) -> "CameraClient":
         return self.connect()
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -113,11 +129,11 @@ class ASIClient(AbstractContextManager):
     def _send(self, cmd: Dict[str, Any]) -> Dict[str, Any]:
         """Send one command, return one reply, raise on protocol errors."""
         if self._ws is None:
-            raise ASIClientError("client is not connected")
+            raise CameraClientError("client is not connected")
         self._ws.send(json.dumps(cmd))
         reply = json.loads(self._ws.recv())
         if isinstance(reply, dict) and "error" in reply:
-            raise ASIClientError(reply["error"])
+            raise CameraClientError(reply["error"])
         return reply
 
     def _recv(self, timeout: Optional[float] = None) -> Dict[str, Any]:
@@ -126,11 +142,38 @@ class ASIClient(AbstractContextManager):
     # -- commands --------------------------------------------------------
 
     def status(self) -> Dict[str, Any]:
-        """Connection state + full control snapshot."""
+        """Connection state + full control snapshot.
+
+        Response includes ``"backend": "asi" | "qhy"`` so a client can tell
+        which camera type the server is currently driving.
+        """
         return self._send({"cmd": "status"})
 
+    def backend(self) -> str:
+        """Return the current camera backend ('asi' or 'qhy')."""
+        reply = self._send({"cmd": "backend"})
+        return reply.get("backend", "")
+
+    def set_backend(self, backend: str) -> Dict[str, Any]:
+        """Switch the active camera backend ('asi' or 'qhy').
+
+        Disconnects the current camera (if any) before switching. Idempotent
+        when called with the already-active backend.
+        """
+        b = str(backend).lower()
+        if b not in ("asi", "qhy"):
+            raise ValueError(f"backend must be 'asi' or 'qhy', got {backend!r}")
+        reply = self._send({"cmd": "backend", "backend": b})
+        if not reply.get("ok", True):
+            raise CameraClientError(reply.get("error", "set_backend failed"))
+        return reply
+
     def list_cameras(self) -> list:
-        """Enumerate attached ASI cameras. Returns [{"index": int, "name": str}, ...]."""
+        """Enumerate attached cameras for the current backend.
+
+        Returns ``[{"index": int, "name": str}, ...]`` -- same shape for ASI
+        and QHY backends.
+        """
         reply = self._send({"cmd": "list_cameras"})
         return reply.get("cameras", [])
 
@@ -138,7 +181,7 @@ class ASIClient(AbstractContextManager):
         """Open the camera at the given driver index (from `list_cameras`)."""
         reply = self._send({"cmd": "connect_camera", "index": int(index)})
         if not reply.get("ok"):
-            raise ASIClientError(reply.get("error", "connect_camera failed"))
+            raise CameraClientError(reply.get("error", "connect_camera failed"))
         return reply
 
     def disconnect_camera(self) -> Dict[str, Any]:
@@ -202,7 +245,7 @@ class ASIClient(AbstractContextManager):
 
         Raises
         ------
-        ASIClientError
+        CameraClientError
             On protocol error, timeout, or save failure.
         """
         if mode not in ("stack", "individual"):
@@ -221,11 +264,11 @@ class ASIClient(AbstractContextManager):
         ack = self._send(cmd)  # immediate ack
         done = self._recv(timeout=timeout)  # record_done from save thread
         if "error" in done:
-            raise ASIClientError(done["error"])
+            raise CameraClientError(done["error"])
         # Surface save failures reported as a message
         msg = done.get("message", "")
         if isinstance(msg, str) and msg.startswith("FITS save error"):
-            raise ASIClientError(msg)
+            raise CameraClientError(msg)
         done["_ack"] = ack
         return done
 
@@ -267,3 +310,7 @@ class ASIClient(AbstractContextManager):
         if target is not None:
             cmd["target"] = int(target)
         return self._send(cmd)
+
+
+# Backward-compat alias. New code should prefer ``CameraClient``.
+ASIClient = CameraClient
