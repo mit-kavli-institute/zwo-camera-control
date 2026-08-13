@@ -37,6 +37,6 @@ zwo-camera-gui --sdk C:\path\to\ASICamera2.dll
 # as module
 python -m zwo_camera_gui --sdk C:\path\to\ASICamera2.dll
 
-# with WebSocket command server
+# with WebSocket command server --- use this one!
 zwo-camera-gui --sdk ASICamera2.dll --ws-port 8765
 ```
