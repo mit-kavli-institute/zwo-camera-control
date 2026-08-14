@@ -134,11 +134,19 @@ class QhyCaptureWorker(QObject):
             self.error.emit(f"BeginQHYCCDLive failed: {exc}")
             return
 
-        # Flush stale DDR frames until ~0.4 s of silence (HANDOFF §3).
-        t_last = time.perf_counter()
-        while (not self._stop.is_set()
-               and time.perf_counter() - t_last < 0.4):
+        # Flush stale DDR frames (HANDOFF §3). Stale frames burst out
+        # back-to-back, so stop at the first 0.35 s gap -- but cap the
+        # whole drain at 1 s: at short exposures the fresh stream never
+        # goes silent, and waiting for silence would drain forever.
+        t0 = time.perf_counter()
+        t_last = t0
+        drained = 0
+        while not self._stop.is_set():
+            now = time.perf_counter()
+            if now - t_last >= 0.35 or now - t0 >= 1.0:
+                break
             if cam.get_live_frame() is not None:
+                drained += 1
                 t_last = time.perf_counter()
             else:
                 time.sleep(0.002)
@@ -155,6 +163,8 @@ class QhyCaptureWorker(QObject):
         total = 0
         fps = 0.0
         prev_arrival = None
+        loop_start = time.perf_counter()
+        warned_no_frames = False
 
         try:
             while not self._stop.is_set():
@@ -171,9 +181,20 @@ class QhyCaptureWorker(QObject):
                 f = cam.get_live_frame()
                 if f is None:
                     # Emit stats even between frames (long exposures).
-                    if now - last_stats >= stats_interval and total:
+                    if now - last_stats >= stats_interval:
                         last_stats = now
                         self._emit_stats(fps, total)
+                    # Watchdog: a healthy stream must deliver within a
+                    # few exposures; report instead of looking dead.
+                    if (total == 0 and not warned_no_frames
+                            and now - loop_start
+                            > max(5.0, 3 * self.exposure_ms / 1000.0)):
+                        warned_no_frames = True
+                        self.error.emit(
+                            f"no frames from camera "
+                            f"{now - loop_start:.0f}s after stream start "
+                            f"(exposure {self.exposure_ms:.0f} ms)"
+                        )
                     time.sleep(0.001)
                     continue
 
