@@ -1,8 +1,9 @@
 """
 JSON WebSocket command interface for remote scripting.
 
-Runs an asyncio event loop in a daemon thread. Commands are dispatched
-to the Qt GUI thread via a signal bridge (thread-safe).
+Runs an asyncio event loop in a daemon thread. Commands are dispatched to
+the ``CameraController`` (marshalled onto its owning Qt thread via a signal
+bridge, so remote and GUI operation share one code path).
 
 Protocol
 --------
@@ -23,7 +24,12 @@ All messages are JSON objects with a "cmd" key:
                           ["FILTER", "Halpha", "narrowband"],
                           ["OBJECT", "M42", null]
                       ]}
+    {"cmd": "abort"}
     {"cmd": "cooler", "on": true, "target": -10}
+    {"cmd": "clear_error"}
+
+The "status" reply includes ``camera_state`` (READY / EXPOSING / ERROR /
+TEC_SETTLING / ...) and ``tec_locked`` for telescope-system polling.
 
 For "record", the server sends two messages:
   1. Immediate ack with the final directory/basename/mode.
@@ -53,24 +59,25 @@ try:
 except ImportError:
     HAS_WEBSOCKETS = False
 
-log = logging.getLogger("asi_demo.ws")
+log = logging.getLogger("cmoscam.ws")
 
 
 class _WsBridge(QObject):
-    """Thread-safe bridge: WS thread -> Qt GUI thread via signal."""
+    """Thread-safe bridge: WS thread -> controller (Qt) thread via signal."""
     dispatch = pyqtSignal(object)
 
 
 class WebSocketServer:
     """Manages the asyncio WS server in a background thread."""
 
-    def __init__(self, app, port=8765):
+    def __init__(self, controller, port=8765):
         if not HAS_WEBSOCKETS:
             raise ImportError("pip install websockets")
-        self._app = app
+        self._controller = controller
         self._port = port
         self._loop = None
         self._thread = None
+        # Created on the controller's thread so the signal queues there.
         self._bridge = _WsBridge()
         self._bridge.dispatch.connect(lambda fn: fn())
 
@@ -100,29 +107,40 @@ class WebSocketServer:
                     await ws.send(json.dumps({"error": "invalid JSON"}))
                     continue
 
+                # For record, register the done-callback BEFORE dispatch so
+                # the save-finished notification can never be missed.
+                done_event = None
+                done_result = [None]
+                if cmd.get("cmd") == "record":
+                    done_event = asyncio.Event()
+                    loop = self._loop
+
+                    def on_done(msg):
+                        done_result[0] = {"cmd": "record_done", "message": msg}
+                        if loop:
+                            loop.call_soon_threadsafe(done_event.set)
+
+                    self._dispatch_sync(
+                        lambda: self._controller.set_record_done_callback(
+                            on_done
+                        )
+                    )
+
                 result = await self._dispatch(cmd)
                 await ws.send(json.dumps(result, default=str))
 
-                # For recording, send a second message when FITS save completes
-                if cmd.get("cmd") == "record" and "error" not in result:
-                    done_event = asyncio.Event()
-                    done_result = [None]
-
-                    def on_done(msg):
-                        done_result[0] = {
-                            "cmd": "record_done", "message": msg
-                        }
-                        if self._loop:
-                            self._loop.call_soon_threadsafe(done_event.set)
-
-                    self._app._ws_record_done_cb = on_done
+                if done_event is not None:
+                    if "error" in result:
+                        # Record never started; drop the callback.
+                        self._dispatch_sync(
+                            lambda: self._controller.set_record_done_callback(
+                                None
+                            )
+                        )
+                        continue
                     try:
-                        await asyncio.wait_for(
-                            done_event.wait(), timeout=600
-                        )
-                        await ws.send(
-                            json.dumps(done_result[0], default=str)
-                        )
+                        await asyncio.wait_for(done_event.wait(), timeout=600)
+                        await ws.send(json.dumps(done_result[0], default=str))
                     except asyncio.TimeoutError:
                         await ws.send(json.dumps({
                             "cmd": "record_done",
@@ -132,16 +150,24 @@ class WebSocketServer:
         except websockets.exceptions.ConnectionClosed:
             log.info("WS client disconnected")
 
+    def _dispatch_sync(self, fn):
+        """Run fn on the controller thread; don't wait for a result."""
+        self._bridge.dispatch.emit(fn)
+
     async def _dispatch(self, cmd):
-        """Execute a command on the GUI thread and return the result."""
+        """Execute a command on the controller thread and return the result."""
         result_event = threading.Event()
         result_holder = [{"error": "timeout"}]
 
-        def _on_gui_thread():
-            result_holder[0] = self._app.handle_ws_command(cmd)
+        def _on_controller_thread():
+            try:
+                result_holder[0] = self._controller.handle_command(cmd)
+            except Exception as e:
+                log.exception("command failed: %s", cmd)
+                result_holder[0] = {"error": str(e)}
             result_event.set()
 
-        self._bridge.dispatch.emit(_on_gui_thread)
+        self._bridge.dispatch.emit(_on_controller_thread)
 
         while not result_event.wait(timeout=0.05):
             await asyncio.sleep(0.01)

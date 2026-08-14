@@ -7,30 +7,41 @@ Launch the GUI with a port::
 
 Then from any other Python process::
 
-    from cmos_camera_gui.client import ASIClient
+    from cmos_camera_gui.client import CameraClient
 
-    with ASIClient("ws://localhost:8765") as cam:
+    with CameraClient("ws://localhost:8765") as cam:
+        cam.connect_camera(0)
         cam.set(Exposure=50_000, Gain=200)
         cam.start_stream()
+        cam.wait_for_state("READY")
         cam.record(20, directory="./captures", basename="demo")
         cam.stop_stream()
 
 The client owns one persistent connection and serializes JSON on/off the wire.
 All methods are blocking; `record` waits for the background FITS save to finish
 before returning.
+
+``camera_state`` in ``status()`` follows the pirt-camera-control state
+vocabulary (READY / EXPOSING / ERROR / TEC_SETTLING / ...), so telescope
+control code can poll it with ``wait_for_state``.
 """
 
 from __future__ import annotations
 
 import json
+import time
 from contextlib import AbstractContextManager
 from typing import Any, Dict, Iterable, List, Optional, Union
 
 from websockets.sync.client import connect as _ws_connect
 
 
-class ASIClientError(RuntimeError):
+class CameraClientError(RuntimeError):
     """Raised when the GUI reports an error or a record save fails."""
+
+
+# Backward-compat alias (pre-multi-vendor name)
+ASIClientError = CameraClientError
 
 
 # Accepted shapes for `extra_headers`:
@@ -82,7 +93,7 @@ def _normalize_headers(headers: HeaderLike) -> List[List[Any]]:
     return out
 
 
-class ASIClient(AbstractContextManager):
+class CameraClient(AbstractContextManager):
     """Blocking client over the GUI's JSON-WebSocket protocol."""
 
     def __init__(self, url: str = "ws://localhost:8765", timeout: float = 5.0):
@@ -92,7 +103,7 @@ class ASIClient(AbstractContextManager):
 
     # -- lifecycle -------------------------------------------------------
 
-    def connect(self) -> "ASIClient":
+    def connect(self) -> "CameraClient":
         if self._ws is None:
             self._ws = _ws_connect(self._url, open_timeout=self._timeout)
         return self
@@ -102,7 +113,7 @@ class ASIClient(AbstractContextManager):
             self._ws.close()
             self._ws = None
 
-    def __enter__(self) -> "ASIClient":
+    def __enter__(self) -> "CameraClient":
         return self.connect()
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -113,11 +124,11 @@ class ASIClient(AbstractContextManager):
     def _send(self, cmd: Dict[str, Any]) -> Dict[str, Any]:
         """Send one command, return one reply, raise on protocol errors."""
         if self._ws is None:
-            raise ASIClientError("client is not connected")
+            raise CameraClientError("client is not connected")
         self._ws.send(json.dumps(cmd))
         reply = json.loads(self._ws.recv())
         if isinstance(reply, dict) and "error" in reply:
-            raise ASIClientError(reply["error"])
+            raise CameraClientError(reply["error"])
         return reply
 
     def _recv(self, timeout: Optional[float] = None) -> Dict[str, Any]:
@@ -138,7 +149,7 @@ class ASIClient(AbstractContextManager):
         """Open the camera at the given driver index (from `list_cameras`)."""
         reply = self._send({"cmd": "connect_camera", "index": int(index)})
         if not reply.get("ok"):
-            raise ASIClientError(reply.get("error", "connect_camera failed"))
+            raise CameraClientError(reply.get("error", "connect_camera failed"))
         return reply
 
     def disconnect_camera(self) -> Dict[str, Any]:
@@ -202,7 +213,7 @@ class ASIClient(AbstractContextManager):
 
         Raises
         ------
-        ASIClientError
+        CameraClientError
             On protocol error, timeout, or save failure.
         """
         if mode not in ("stack", "individual"):
@@ -221,11 +232,11 @@ class ASIClient(AbstractContextManager):
         ack = self._send(cmd)  # immediate ack
         done = self._recv(timeout=timeout)  # record_done from save thread
         if "error" in done:
-            raise ASIClientError(done["error"])
+            raise CameraClientError(done["error"])
         # Surface save failures reported as a message
         msg = done.get("message", "")
         if isinstance(msg, str) and msg.startswith("FITS save error"):
-            raise ASIClientError(msg)
+            raise CameraClientError(msg)
         done["_ack"] = ack
         return done
 
@@ -267,3 +278,51 @@ class ASIClient(AbstractContextManager):
         if target is not None:
             cmd["target"] = int(target)
         return self._send(cmd)
+
+    def abort(self) -> Dict[str, Any]:
+        """Cancel an in-progress recording."""
+        return self._send({"cmd": "abort"})
+
+    def clear_error(self) -> Dict[str, Any]:
+        """Clear a latched ERROR state."""
+        return self._send({"cmd": "clear_error"})
+
+    # -- state polling ---------------------------------------------------
+
+    def camera_state(self) -> str:
+        """Current FSM state name (READY, EXPOSING, TEC_SETTLING, ...)."""
+        return str(self.status().get("camera_state", "UNKNOWN"))
+
+    def wait_for_state(
+        self,
+        target_state: str = "READY",
+        timeout: float = 60.0,
+        poll_s: float = 0.5,
+    ) -> str:
+        """
+        Poll ``status()`` until ``camera_state`` equals `target_state`.
+
+        Returns the reached state. Raises ``CameraClientError`` on timeout,
+        or immediately if the camera enters ERROR while waiting for a
+        different state.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            state = self.camera_state()
+            if state == target_state:
+                return state
+            if state == "ERROR" and target_state != "ERROR":
+                raise CameraClientError(
+                    "camera entered ERROR while waiting for "
+                    f"{target_state}"
+                )
+            if time.monotonic() >= deadline:
+                raise CameraClientError(
+                    f"timed out after {timeout:g}s waiting for "
+                    f"{target_state} (still {state})"
+                )
+            time.sleep(poll_s)
+
+
+# Backward-compat alias (pre-multi-vendor name)
+ASIClient = CameraClient

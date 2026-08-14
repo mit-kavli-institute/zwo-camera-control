@@ -10,6 +10,7 @@ import sys
 
 from PyQt5.QtWidgets import QApplication
 
+from .core.controller import CameraController
 from .style import DARK_STYLE
 from .gui import MainWindow
 
@@ -40,8 +41,13 @@ def main():
     app = QApplication(sys.argv)
     app.setStyleSheet(DARK_STYLE)
 
-    win = MainWindow(sdk_path=args.sdk, ws_port=args.ws_port)
+    # Controller first (headless command surface), then the GUI as its view.
+    # SDK load is deferred until the window exists so its status message
+    # lands in the status bar.
+    controller = CameraController(sdk_path=False)
+    win = MainWindow(controller, ws_port=args.ws_port)
     win.show()
+    controller.load_sdk(args.sdk)
     sys.exit(app.exec_())
 
 

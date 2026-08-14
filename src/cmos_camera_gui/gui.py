@@ -1,8 +1,10 @@
 """
-Main application window.
+Main application window — a *view* over ``core.controller.CameraController``.
 
-Sidebar with camera controls, image display with histogram, stats bar,
-FITS recording, cooler management, and WebSocket command handling.
+All camera operation (SDK, connection, settings, streaming, recording,
+cooler, remote commands) lives in the controller; this module only renders
+controller signals and pushes user input into controller methods. Nothing
+here may import vendor SDK modules.
 
 Camera controls are built dynamically from what each camera actually
 reports, so it works correctly with the ASI294MM Pro, ASI662MM, and
@@ -15,9 +17,7 @@ import os
 import queue
 import time
 
-import numpy as np
-
-from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSlot
+from PyQt5.QtCore import Qt, QTimer, pyqtSlot
 from PyQt5.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox,
     QFileDialog, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
@@ -26,16 +26,13 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from .sdk import ASICamera, ASIDriver, ASIError, CameraInfo, Ctrl, ImgType
-from .camera_config import (
-    CameraControlSet, CameraSettings, ControlKind, ControlSpec, FLIP_LABELS,
-)
+from .camera_config import ControlKind, ControlSpec, FLIP_LABELS
+from .core.controller import CameraController
 from .stretch import STRETCH_FUNCS
-from .capture import CaptureWorker
-from .recorder import save_fits_cube, save_fits_individual, HAS_ASTROPY
+from .recorder import HAS_ASTROPY
 from .widgets import HistogramWidget, ImageDisplay
 
-log = logging.getLogger("asi_demo.gui")
+log = logging.getLogger("cmoscam.gui")
 
 # Maximum slider range before we switch to a spinbox.
 _SLIDER_MAX_RANGE = 4096
@@ -43,9 +40,20 @@ _SLIDER_MAX_RANGE = 4096
 # Exposure unit choices: (label, µs-per-unit)
 _EXP_UNITS = [("µs", 1), ("ms", 1_000), ("s", 1_000_000)]
 
+# camera_state -> stats-bar chip color
+_STATE_COLORS = {
+    "DISCONNECTED": "#555",
+    "INITIALIZING": "#ffaa00",
+    "TEC_SETTLING": "#00aaff",
+    "READY": "#00e87a",
+    "EXPOSING": "#ff4444",
+    "SAVING": "#ffaa00",
+    "ERROR": "#ff2222",
+}
+
 
 # =====================================================================
-#  Dynamic control widget (PyQt5 equivalent of tkinter ControlWidget)
+#  Dynamic control widget
 # =====================================================================
 
 class ControlWidget(QWidget):
@@ -265,38 +273,18 @@ class ControlWidget(QWidget):
 
 class MainWindow(QMainWindow):
 
-    def __init__(self, sdk_path=None, ws_port=0):
+    def __init__(self, controller: CameraController, ws_port=0):
         super().__init__()
         self.setWindowTitle("CMOS Control GUI")
         self.setMinimumSize(950, 620)
         self.resize(1200, 750)
 
-        self._driver = None
-        self._camera = None
-        self._worker = None
-        self._worker_thread = None
-        self._last_raw_frame = None
-        self._streaming = False
-
-        # Dynamic camera config
-        self._control_set = None   # CameraControlSet
-        self._settings = None      # CameraSettings
+        self._c = controller
         self._ctrl_widgets = {}    # name -> ControlWidget
-
-        # WebSocket recording callback (set by ws_server during record cmd)
-        self._ws_record_done_cb = None
-
-        # Optional per-record header extras (set by WS record cmd, consumed
-        # in _on_recording_done, cleared after).
-        self._next_record_obstype = None
-        self._next_record_extras = []
+        self._last_raw_frame = None
 
         self._build_ui()
-        self._init_sdk(sdk_path)
-
-        # Cooler poll timer
-        self._cooler_timer = QTimer(self)
-        self._cooler_timer.timeout.connect(self._update_cooler_readout)
+        self._connect_controller_signals()
 
         # Display poll timer — drains frame queue, self-rescheduling.
         # Single-shot avoids pileup if stretch takes longer than the interval.
@@ -306,37 +294,38 @@ class MainWindow(QMainWindow):
         self._display_timer.timeout.connect(self._poll_frames)
         self._last_hist_time = 0.0  # rate-limit histogram to ~5 Hz
 
+        self._c.display_stretch = self._stretch_combo.currentText()
+
         # Optional WebSocket server
         self._ws_server = None
         if ws_port > 0:
             self._start_ws_server(ws_port)
 
     # =====================================================================
-    #  SDK init
+    #  Controller signal wiring
     # =====================================================================
 
-    def _init_sdk(self, path=None):
-        candidates = []
-        if path:
-            candidates.append(path)
-        candidates += [
-            "ASICamera2.dll",
-            r"C:\Program Files\ASIStudio\ASICamera2.dll",
-            r"C:\Program Files (x86)\ASIStudio\ASICamera2.dll",
-            "/usr/lib/libASICamera2.so",
-            "/usr/local/lib/libASICamera2.so",
-        ]
-        for c in candidates:
-            if os.path.isfile(c):
-                try:
-                    self._driver = ASIDriver(c)
-                    self._set_status(f"SDK loaded: {c}")
-                    return
-                except Exception as e:
-                    self._set_status(f"SDK load failed ({c}): {e}")
-        self._set_status(
-            "SDK not found -- click Browse SDK to locate ASICamera2.dll/.so"
-        )
+    def _connect_controller_signals(self):
+        c = self._c
+        c.status_message.connect(self._set_status)
+        c.state_changed.connect(self._on_state_changed)
+        c.connected_changed.connect(self._on_connected_changed)
+        c.streaming_changed.connect(self._on_streaming_changed)
+        c.control_changed.connect(self._on_remote_control_changed)
+        c.roi_changed.connect(self._sync_roi_widgets)
+        c.record_params_changed.connect(self._sync_record_widgets)
+        c.record_started.connect(self._on_record_started)
+        c.record_progress.connect(self._on_rec_progress)
+        c.record_finished.connect(self._on_record_finished)
+        c.record_cancelled.connect(self._on_record_cancelled)
+        c.stats_update.connect(self._on_stats)
+        c.thermal_update.connect(self._on_thermal_update)
+
+        self._on_state_changed(c.camera_state.name)
+
+    # =====================================================================
+    #  SDK / connection actions
+    # =====================================================================
 
     def _browse_sdk(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -345,32 +334,28 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        try:
-            self._driver = ASIDriver(path)
-            self._set_status(f"SDK loaded: {path}")
-        except Exception as e:
-            QMessageBox.critical(self, "SDK Error", str(e))
-
-    # =====================================================================
-    #  Camera connection
-    # =====================================================================
+        self._c.load_sdk(path)
 
     def _refresh_cameras(self):
-        if not self._driver:
+        if not self._c.sdk_loaded:
             self._set_status("Load SDK first")
             return
-        n = self._driver.get_num_cameras()
         self._cam_combo.clear()
-        if n == 0:
+        try:
+            cams = self._c.list_cameras()
+        except Exception as e:
+            self._set_status(f"Camera scan failed: {e}")
+            return
+        if not cams:
             self._set_status("No cameras found")
             return
-        for i in range(n):
-            info = CameraInfo.from_struct(self._driver.get_camera_property(i))
-            self._cam_combo.addItem(f"{i}: {info.name}", i)
-        self._set_status(f"Found {n} camera(s)")
+        for cam in cams:
+            self._cam_combo.addItem(f"{cam['index']}: {cam['name']}",
+                                    cam["index"])
+        self._set_status(f"Found {len(cams)} camera(s)")
 
     def _connect(self):
-        if not self._driver:
+        if not self._c.sdk_loaded:
             QMessageBox.warning(self, "No SDK", "Load the SDK first.")
             return
         idx = self._cam_combo.currentData()
@@ -380,84 +365,35 @@ class MainWindow(QMainWindow):
             )
             return
         try:
-            self._camera = ASICamera(self._driver, idx)
-            cam = self._camera
+            self._c.connect_camera(idx)
+        except Exception as e:
+            QMessageBox.critical(self, "Connect Error", str(e))
 
-            # Build dynamic control set from what the camera reports
-            caps_dict = cam.get_caps_dict()
-            self._control_set = CameraControlSet.from_caps_dict(
-                cam.info.name, caps_dict
-            )
-            self._settings = CameraSettings(self._control_set)
-            log.info("\n%s", self._control_set.describe())
-
-            # Max out USB bandwidth for streaming
-            self._settings.set_if_present("BandWidth", 9999, clamp=True)
-
-            # Build dynamic controls UI and apply defaults
+    def _on_connected_changed(self, connected: bool):
+        if connected:
             self._rebuild_controls_panel()
-            self._apply_settings(silent=True)
+            self._sync_roi_ranges()
+            self._sync_roi_widgets()
 
-            # Sync ROI limits
-            self._roi_w.setMaximum(cam.info.max_width)
-            self._roi_h.setMaximum(cam.info.max_height)
-            self._roi_x.setMaximum(cam.info.max_width - 8)
-            self._roi_y.setMaximum(cam.info.max_height - 2)
-            self._roi_w.setValue(cam.info.max_width)
-            self._roi_h.setValue(cam.info.max_height)
-            self._roi_x.setValue(0)
-            self._roi_y.setValue(0)
-
-            # Cooler section
-            self._cooler_group.setVisible(self._control_set.has_cooler())
-            if self._control_set.has_cooler():
-                self._cooler_timer.start(2000)
-                spec = self._control_set.get("TargetTemp")
+            cs = self._c.control_set
+            self._cooler_group.setVisible(cs.has_cooler())
+            if cs.has_cooler():
+                spec = cs.get("TargetTemp")
                 if spec:
                     self._cooler_temp.setRange(spec.min_value, spec.max_value)
                     self._cooler_temp.setValue(spec.default_value)
 
-            # Status line with capability flags
-            flags = []
-            if self._control_set.has_cooler():
-                flags.append("cooled")
-            if self._control_set.has_frame_rate_control():
-                flags.append("indep-fps")
-            if self._control_set.has_offset():
-                flags.append("offset")
-            self._set_status(
-                f"Connected: {cam.info.name}  |  "
-                f"{cam.info.max_width}x{cam.info.max_height}  |  "
-                f"{cam.info.bit_depth}-bit  |  "
-                f"USB3={'yes' if cam.info.is_usb3 else 'no'}  |  "
-                + "  ".join(flags)
-            )
             self._connect_btn.setText("Disconnect")
             self._connect_btn.setStyleSheet("background-color: #5a1414;")
             self._connect_btn.clicked.disconnect()
-            self._connect_btn.clicked.connect(self._disconnect)
-
-        except (ASIError, Exception) as e:
-            self._camera = None
-            self._control_set = None
-            self._settings = None
-            QMessageBox.critical(self, "Connect Error", str(e))
-
-    def _disconnect(self):
-        self._stop_stream()
-        self._cooler_timer.stop()
-        if self._camera:
-            self._camera.close()
-            self._camera = None
-        self._control_set = None
-        self._settings = None
-        self._clear_controls_panel()
-        self._connect_btn.setText("Connect")
-        self._connect_btn.setStyleSheet("background-color: #1a3a1a;")
-        self._connect_btn.clicked.disconnect()
-        self._connect_btn.clicked.connect(self._connect)
-        self._cooler_group.setVisible(False)
-        self._set_status("Disconnected")
+            self._connect_btn.clicked.connect(self._c.disconnect_camera)
+        else:
+            self._clear_controls_panel()
+            self._connect_btn.setText("Connect")
+            self._connect_btn.setStyleSheet("background-color: #1a3a1a;")
+            self._connect_btn.clicked.disconnect()
+            self._connect_btn.clicked.connect(self._connect)
+            self._cooler_group.setVisible(False)
 
     # =====================================================================
     #  Dynamic controls panel
@@ -466,19 +402,25 @@ class MainWindow(QMainWindow):
     def _rebuild_controls_panel(self):
         """Clear and rebuild the CAMERA CONTROLS group from the control set."""
         self._clear_controls_panel()
-        if not self._control_set:
+        cs = self._c.control_set
+        if not cs:
             return
 
         layout = self._ctrl_group.layout()
 
         # Writable controls
-        for spec in self._control_set.writable():
-            w = ControlWidget(spec, on_change=self._on_ctrl_changed)
+        for spec in cs.writable():
+            w = ControlWidget(spec, on_change=self._c.stage_control)
             layout.addWidget(w)
             self._ctrl_widgets[spec.name] = w
+            # Reflect any value already staged in the controller (e.g.
+            # BandWidth override applied at connect, or remote edits).
+            val = self._c.settings.get(spec.name)
+            if val is not None and val != w.get_value():
+                w.set_value(val)
 
         # Read-only controls
-        ro = self._control_set.readonly()
+        ro = cs.readonly()
         if ro:
             layout.addWidget(self._sep())
             lbl = QLabel("READ ONLY")
@@ -498,157 +440,103 @@ class MainWindow(QMainWindow):
                 widget.deleteLater()
         self._ctrl_widgets.clear()
 
-    def _on_ctrl_changed(self, name: str, value: int):
-        if self._settings:
-            try:
-                self._settings.set(name, value, clamp=True)
-            except Exception:
-                pass
+    def _on_remote_control_changed(self, name: str, value: int):
+        w = self._ctrl_widgets.get(name)
+        if w:
+            w.set_value(value)
 
     # =====================================================================
-    #  Settings
+    #  ROI / settings
     # =====================================================================
 
-    def _apply_settings(self, silent=False):
-        cam = self._camera
-        if not cam or not self._settings:
-            if not silent:
-                QMessageBox.warning(self, "No camera", "Connect first.")
+    def _sync_roi_ranges(self):
+        cam = self._c.camera
+        if not cam:
             return
+        self._roi_w.setMaximum(cam.info.max_width)
+        self._roi_h.setMaximum(cam.info.max_height)
+        self._roi_x.setMaximum(cam.info.max_width - 8)
+        self._roi_y.setMaximum(cam.info.max_height - 2)
+
+    def _sync_roi_widgets(self):
+        """Reflect controller ROI/img_type into the widgets."""
+        roi = self._c.roi
+        self._roi_w.setValue(roi["w"])
+        self._roi_h.setValue(roi["h"])
+        self._roi_x.setValue(roi["x"])
+        self._roi_y.setValue(roi["y"])
+        if self._c.img_type == "RAW16":
+            self._raw16_rb.setChecked(True)
+        else:
+            self._raw8_rb.setChecked(True)
+
+    def _push_roi(self):
+        """Push widget ROI/img_type into the controller (GUI-origin)."""
+        self._c.set_roi(
+            x=self._roi_x.value(), y=self._roi_y.value(),
+            w=self._roi_w.value(), h=self._roi_h.value(),
+            img_type="RAW16" if self._raw16_rb.isChecked() else "RAW8",
+            notify=False,
+        )
+
+    def _roi_full_frame(self):
+        if self._c.connected:
+            self._c.full_frame_roi()
+
+    def _apply_settings(self):
+        if not self._c.connected:
+            QMessageBox.warning(self, "No camera", "Connect first.")
+            return
+        self._push_roi()
         try:
-            # Sync all widget values into settings
-            for name, w in self._ctrl_widgets.items():
-                spec = self._control_set.get(name) if self._control_set else None
-                if spec and not spec.is_readonly:
-                    try:
-                        self._settings.set(name, w.get_value(), clamp=True)
-                    except Exception:
-                        pass
-
-            # Set ROI / image format
-            img_type = (
-                ImgType.RAW16 if self._raw16_rb.isChecked() else ImgType.RAW8
-            )
-            cam.set_roi(
-                self._roi_w.value(), self._roi_h.value(),
-                1, img_type,
-                self._roi_x.value(), self._roi_y.value(),
-            )
-
-            # Push all control values to the camera
-            errors = self._settings.apply(cam)
-
-            if not silent:
-                if errors:
-                    err_str = ", ".join(f"{n}: {e}" for n, e in errors)
-                    self._set_status(f"Settings errors: {err_str}")
-                else:
-                    w, h, _b, _t = cam.get_roi()
-                    self._set_status(
-                        f"Applied -- "
-                        f"ROI={w}x{h}+({self._roi_x.value()},{self._roi_y.value()})  "
-                        f"{'RAW16' if img_type == ImgType.RAW16 else 'RAW8'}  "
-                        f"({len(self._ctrl_widgets)} controls)"
-                    )
-        except (ASIError, Exception) as e:
-            if not silent:
-                QMessageBox.critical(self, "Settings Error", str(e))
-            else:
-                self._set_status(f"Settings error: {e}")
+            self._c.apply_settings(silent=False)
+        except Exception as e:
+            QMessageBox.critical(self, "Settings Error", str(e))
 
     # =====================================================================
     #  Cooler
     # =====================================================================
 
     def _apply_cooler(self):
-        cam = self._camera
-        if not cam or not cam.info.is_cooler:
-            return
         try:
-            cam.set_cooler(
+            self._c.set_cooler(
                 on=self._cooler_on_cb.isChecked(),
                 target_c=self._cooler_temp.value(),
             )
-            state = "ON" if self._cooler_on_cb.isChecked() else "OFF"
-            self._set_status(
-                f"Cooler {state}, target={self._cooler_temp.value()} C"
-            )
-        except ASIError as e:
+        except Exception as e:
             self._set_status(f"Cooler error: {e}")
 
-    def _update_cooler_readout(self):
-        cam = self._camera
-        if not cam or not cam.info.is_cooler:
-            return
-        try:
-            temp = cam.temperature()
-            power = (
-                cam.get_ctrl_value(Ctrl.COOLER_POWER_PERC)
-                if cam.has_ctrl(Ctrl.COOLER_POWER_PERC) else 0
-            )
-            self._cooler_readout.setText(
-                f"Sensor: {temp:.1f} C   Power: {power}%"
-            )
-        except ASIError:
-            pass
+    def _on_thermal_update(self, temp: float, power: float):
+        self._cooler_readout.setText(
+            f"Sensor: {temp:.1f} C   Power: {power:.0f}%"
+        )
 
     # =====================================================================
     #  Streaming
     # =====================================================================
 
     def _start_stream(self):
-        cam = self._camera
-        if not cam:
-            QMessageBox.warning(self, "No camera", "Connect a camera first.")
-            return
-
-        # Get exposure in ms for timeout calculation
-        exp_us = self._settings.get("Exposure") if self._settings else 100_000
-        exp_ms = (exp_us or 100_000) / 1000.0
-
-        self._worker = CaptureWorker(cam, exp_ms)
-        self._worker_thread = QThread()
-        self._worker.moveToThread(self._worker_thread)
-
-        # Connect signals — low-frequency only (no frame_ready signal;
-        # frames are delivered via worker.frame_queue, polled by QTimer).
-        self._worker_thread.started.connect(self._worker.run)
-        self._worker.stats_update.connect(self._on_stats)
-        self._worker.recording_progress.connect(self._on_rec_progress)
-        self._worker.recording_done.connect(self._on_recording_done)
-        self._worker.error.connect(
-            lambda msg: self._set_status(f"Capture: {msg}")
-        )
-
-        self._worker_thread.start()
-        self._display_timer.start(self._display_interval)
-        self._streaming = True
-
-        self._stream_btn.setText("■  Stop Stream")
-        self._stream_btn.setStyleSheet("background-color: #5a1414;")
-        self._stream_btn.clicked.disconnect()
-        self._stream_btn.clicked.connect(self._stop_stream)
-        self._set_status("Streaming...")
-
-    def _stop_stream(self):
-        self._display_timer.stop()
-        if self._worker:
-            self._worker.request_stop()
-        if self._worker_thread:
-            self._worker_thread.quit()
-            self._worker_thread.wait(5000)
-        self._worker = None
-        self._worker_thread = None
-        self._streaming = False
-
-        self._stream_btn.setText("▶  Start Stream")
-        self._stream_btn.setStyleSheet("background-color: #1a3a1a;")
         try:
+            self._c.start_stream()
+        except Exception as e:
+            QMessageBox.warning(self, "Stream", str(e))
+
+    def _on_streaming_changed(self, streaming: bool):
+        if streaming:
+            self._display_timer.start(self._display_interval)
+            self._stream_btn.setText("■  Stop Stream")
+            self._stream_btn.setStyleSheet("background-color: #5a1414;")
             self._stream_btn.clicked.disconnect()
-        except TypeError:
-            pass
-        self._stream_btn.clicked.connect(self._start_stream)
-        self._set_status("Stream stopped")
+            self._stream_btn.clicked.connect(self._c.stop_stream)
+        else:
+            self._display_timer.stop()
+            self._stream_btn.setText("▶  Start Stream")
+            self._stream_btn.setStyleSheet("background-color: #1a3a1a;")
+            try:
+                self._stream_btn.clicked.disconnect()
+            except TypeError:
+                pass
+            self._stream_btn.clicked.connect(self._start_stream)
 
     # =====================================================================
     #  Frame / stats slots
@@ -661,9 +549,9 @@ class MainWindow(QMainWindow):
         so slow stretches can't cause pileup.
         """
         try:
-            if not self._worker:
+            fq = self._c.frame_queue
+            if fq is None:
                 return
-            fq = self._worker.frame_queue
             frame = None
             # Drain to latest — discard stale frames
             try:
@@ -687,7 +575,7 @@ class MainWindow(QMainWindow):
                 self._histogram.update_data(frame, z1, z2)
         finally:
             # Re-arm for next tick (fires AFTER this work completes)
-            if self._streaming:
+            if self._c.streaming:
                 self._display_timer.start(self._display_interval)
 
     @pyqtSlot(float, int, int, float)
@@ -708,15 +596,55 @@ class MainWindow(QMainWindow):
             self._temp_lbl.setText(f"{temp:.1f} C")
 
         # Update readonly control widgets (temperature, cooler power, etc.)
-        if self._camera and self._control_set:
-            for spec in self._control_set.readonly():
-                w = self._ctrl_widgets.get(spec.name)
-                if w:
-                    try:
-                        val = self._camera.get_ctrl_value(spec.control_type)
-                        w.update_readonly(val)
-                    except (ASIError, Exception):
-                        pass
+        for name, val in self._c.readonly_values().items():
+            w = self._ctrl_widgets.get(name)
+            if w:
+                w.update_readonly(val)
+
+    def _on_state_changed(self, name: str):
+        color = _STATE_COLORS.get(name, "#aaa")
+        self._state_lbl.setText(name)
+        self._state_lbl.setStyleSheet(
+            f"color: {color}; font: bold 10pt 'Courier New';"
+        )
+
+    # =====================================================================
+    #  FITS recording
+    # =====================================================================
+
+    def _push_record_params(self):
+        self._c.set_record_params(
+            n_frames=self._nframes_spin.value(),
+            directory=self._fits_dir.text().strip() or os.getcwd(),
+            basename=self._fits_basename.text().strip() or "capture",
+            mode="stack" if self._mode_stack_rb.isChecked() else "individual",
+            notify=False,
+        )
+
+    def _sync_record_widgets(self):
+        p = self._c.record_params
+        self._nframes_spin.setValue(int(p["n_frames"]))
+        self._fits_dir.setText(str(p["directory"]))
+        self._fits_basename.setText(str(p["basename"]))
+        if p["mode"] == "stack":
+            self._mode_stack_rb.setChecked(True)
+        else:
+            self._mode_indiv_rb.setChecked(True)
+
+    def _start_record(self):
+        self._push_record_params()
+        try:
+            self._c.start_record()
+        except Exception as e:
+            QMessageBox.warning(self, "Record", str(e))
+
+    def _on_record_started(self, n: int):
+        self._rec_btn.setText("✕  Cancel")
+        self._rec_btn.setStyleSheet("background-color: #5a1414;")
+        self._rec_btn.clicked.disconnect()
+        self._rec_btn.clicked.connect(self._c.cancel_record)
+        self._rec_lbl.setText(f"REC  0/{n}")
+        self._rec_progress.setValue(0)
 
     @pyqtSlot(int, int)
     def _on_rec_progress(self, got, target):
@@ -724,124 +652,15 @@ class MainWindow(QMainWindow):
             self._rec_progress.setValue(int(got / target * 100))
             self._rec_lbl.setText(f"REC  {got}/{target}")
 
-    # =====================================================================
-    #  FITS recording
-    # =====================================================================
+    def _on_record_finished(self, msg: str):
+        self._reset_rec_button()
+        self._rec_progress.setValue(100)
+        self._rec_lbl.setText("DONE")
 
-    def _start_record(self):
-        if not HAS_ASTROPY:
-            QMessageBox.critical(self, "No astropy", "pip install astropy")
-            return
-        if not self._worker or not self._streaming:
-            QMessageBox.warning(
-                self, "Not streaming", "Start the stream first."
-            )
-            return
-
-        n = self._nframes_spin.value()
-        cam = self._camera
-        w, h, _bin, img_t = cam.get_roi()
-        dtype = np.uint16 if img_t == int(ImgType.RAW16) else np.uint8
-
-        self._worker.start_recording(n, w, h, dtype)
-
-        self._rec_btn.setText("✕  Cancel")
-        self._rec_btn.setStyleSheet("background-color: #5a1414;")
-        self._rec_btn.clicked.disconnect()
-        self._rec_btn.clicked.connect(self._cancel_record)
-        self._rec_lbl.setText(f"REC  0/{n}")
-        self._rec_progress.setValue(0)
-        self._set_status(f"Recording {n} frames...")
-
-    def _cancel_record(self):
-        if self._worker:
-            self._worker.cancel_recording()
+    def _on_record_cancelled(self):
         self._reset_rec_button()
         self._rec_progress.setValue(0)
         self._rec_lbl.setText("")
-        self._next_record_obstype = None
-        self._next_record_extras = []
-        self._set_status("Recording cancelled")
-
-    @pyqtSlot(object, object, float)
-    def _on_recording_done(self, cube, timestamps, elapsed):
-        """Signal from capture worker -- safe to touch GUI here."""
-        self._reset_rec_button()
-        self._rec_lbl.setText("SAVING...")
-
-        directory = self._fits_dir.text().strip() or os.getcwd()
-        basename = self._fits_basename.text().strip() or "capture"
-        stack_mode = self._mode_stack_rb.isChecked()
-
-        cam = self._camera
-        actual_fps = cube.shape[0] / elapsed if elapsed > 0 else 0
-
-        meta = {
-            "INSTRUME": cam.info.name if cam else "ZWO ASI",
-            "NFRAMES": cube.shape[0],
-            "STRMFPS": (round(actual_fps, 3), "measured stream rate [fps]"),
-            "ELAPSED": (round(elapsed, 4), "total acquisition time [s]"),
-            "DEPTH": "RAW16" if self._raw16_rb.isChecked() else "RAW8",
-            "STRETCH": self._stretch_combo.currentText(),
-        }
-        if self._next_record_obstype:
-            meta["OBSTYPE"] = self._next_record_obstype
-
-        # Include all current control values in FITS header.
-        # Exposure is written separately as EXPTIME (in ms) below.
-        if self._settings:
-            snap = self._settings.snapshot()
-            for k, v in snap.items():
-                if k == "Exposure":
-                    continue
-                meta[k[:8].upper()] = v
-            if "Exposure" in snap:
-                meta["EXPTIME"] = (
-                    snap["Exposure"] / 1000.0, "[ms] exposure time"
-                )
-        if cam:
-            w, h, _b, _t = cam.get_roi()
-            meta["ROI_W"] = w
-            meta["ROI_H"] = h
-            meta["ROI_X"] = self._roi_x.value()
-            meta["ROI_Y"] = self._roi_y.value()
-            if cam.info.is_cooler:
-                try:
-                    meta["DETTEMP"] = (cam.temperature(), "[C] sensor temperature")
-                except ASIError:
-                    pass
-
-        # Extras from WS client: list of [key, value, comment_or_null].
-        # Applied last so the user can override any of the above.
-        for extra in (self._next_record_extras or []):
-            key = extra[0]
-            val = extra[1]
-            cmt = extra[2] if len(extra) > 2 else None
-            meta[key] = (val, cmt) if cmt else val
-        self._next_record_obstype = None
-        self._next_record_extras = []
-
-        def _after_save(msg):
-            self._set_status(msg)
-            self._rec_progress.setValue(100)
-            self._rec_lbl.setText("DONE")
-            if self._ws_record_done_cb:
-                self._ws_record_done_cb(msg)
-                self._ws_record_done_cb = None
-
-        try:
-            os.makedirs(directory, exist_ok=True)
-        except OSError as e:
-            _after_save(f"FITS save error: cannot create {directory}: {e}")
-            return
-
-        if stack_mode:
-            path = os.path.join(directory, f"{basename}.fits")
-            save_fits_cube(path, cube, meta, _after_save)
-        else:
-            save_fits_individual(
-                directory, basename, cube, timestamps, meta, _after_save
-            )
 
     def _reset_rec_button(self):
         self._rec_btn.setText("⬤  Record FITS")
@@ -863,153 +682,6 @@ class MainWindow(QMainWindow):
         self._pixel_lbl.setText("x --  y --  val --")
 
     # =====================================================================
-    #  WebSocket command handler
-    # =====================================================================
-
-    def handle_ws_command(self, cmd):
-        """Called on the GUI thread by the WS bridge."""
-        action = cmd.get("cmd", "")
-
-        if action == "status":
-            cam = self._camera
-            result = {
-                "cmd": "status",
-                "connected": cam is not None,
-                "streaming": self._streaming,
-                "camera": cam.info.name if cam else None,
-            }
-            if self._settings:
-                result["controls"] = self._settings.snapshot()
-            return result
-
-        elif action == "list_cameras":
-            if not self._driver:
-                return {"cmd": "list_cameras", "cameras": [],
-                        "error": "SDK not loaded"}
-            cams = []
-            try:
-                n = self._driver.get_num_cameras()
-                for i in range(n):
-                    info = CameraInfo.from_struct(
-                        self._driver.get_camera_property(i)
-                    )
-                    cams.append({"index": i, "name": info.name})
-            except (ASIError, Exception) as e:
-                return {"cmd": "list_cameras", "cameras": [], "error": str(e)}
-            return {"cmd": "list_cameras", "cameras": cams}
-
-        elif action == "connect_camera":
-            if self._camera is not None:
-                return {"cmd": "connect_camera", "ok": True,
-                        "camera": self._camera.info.name,
-                        "note": "already connected"}
-            idx = cmd.get("index", 0)
-            # Refresh the combo so the selection round-trips cleanly to the GUI.
-            self._refresh_cameras()
-            for i in range(self._cam_combo.count()):
-                if self._cam_combo.itemData(i) == idx:
-                    self._cam_combo.setCurrentIndex(i)
-                    break
-            else:
-                return {"cmd": "connect_camera", "ok": False,
-                        "error": f"no camera with index {idx}"}
-            self._connect()
-            ok = self._camera is not None
-            return {
-                "cmd": "connect_camera", "ok": ok,
-                "camera": self._camera.info.name if ok else None,
-            }
-
-        elif action == "disconnect_camera":
-            if self._camera is None:
-                return {"cmd": "disconnect_camera", "ok": True,
-                        "note": "not connected"}
-            self._disconnect()
-            return {"cmd": "disconnect_camera", "ok": True}
-
-        elif action == "set":
-            if self._settings:
-                for key, value in cmd.items():
-                    if key == "cmd":
-                        continue
-                    # Handle img_type and ROI separately
-                    if key == "img_type":
-                        if value == "RAW8":
-                            self._raw8_rb.setChecked(True)
-                        else:
-                            self._raw16_rb.setChecked(True)
-                        continue
-                    roi_map = {
-                        "roi_w": self._roi_w, "roi_h": self._roi_h,
-                        "roi_x": self._roi_x, "roi_y": self._roi_y,
-                    }
-                    if key in roi_map:
-                        roi_map[key].setValue(int(value))
-                        continue
-                    # Try setting as a camera control
-                    w = self._ctrl_widgets.get(key)
-                    if w:
-                        w.set_value(int(value))
-                    else:
-                        self._settings.set_if_present(key, value, clamp=True)
-            self._apply_settings(silent=True)
-            return {"cmd": "set", "ok": True}
-
-        elif action == "start_stream":
-            self._start_stream()
-            return {"cmd": "start_stream", "ok": self._streaming}
-
-        elif action == "stop_stream":
-            self._stop_stream()
-            return {"cmd": "stop_stream", "ok": True}
-
-        elif action == "record":
-            n = cmd.get("n_frames", 100)
-            self._nframes_spin.setValue(n)
-
-            # Backward-compat: `path` sets directory+basename in one shot.
-            if "path" in cmd:
-                p = cmd["path"]
-                d, f = os.path.split(p)
-                if d:
-                    self._fits_dir.setText(d)
-                base, _ext = os.path.splitext(f)
-                if base:
-                    self._fits_basename.setText(base)
-
-            if "directory" in cmd:
-                self._fits_dir.setText(str(cmd["directory"]))
-            if "basename" in cmd:
-                self._fits_basename.setText(str(cmd["basename"]))
-
-            mode = cmd.get("mode", "stack").lower()
-            if mode == "individual":
-                self._mode_indiv_rb.setChecked(True)
-            else:
-                self._mode_stack_rb.setChecked(True)
-
-            self._next_record_obstype = cmd.get("obstype") or None
-            self._next_record_extras = list(cmd.get("extra_headers") or [])
-
-            self._start_record()
-            return {
-                "cmd": "record", "ack": True,
-                "n_frames": n,
-                "directory": self._fits_dir.text(),
-                "basename": self._fits_basename.text(),
-                "mode": "stack" if self._mode_stack_rb.isChecked() else "individual",
-            }
-
-        elif action == "cooler":
-            self._cooler_on_cb.setChecked(cmd.get("on", False))
-            if "target" in cmd:
-                self._cooler_temp.setValue(int(cmd["target"]))
-            self._apply_cooler()
-            return {"cmd": "cooler", "ok": True}
-
-        return {"error": f"unknown command: {action}"}
-
-    # =====================================================================
     #  WebSocket server
     # =====================================================================
 
@@ -1019,7 +691,7 @@ class MainWindow(QMainWindow):
             if not HAS_WEBSOCKETS:
                 log.warning("websockets not installed -- WS server disabled")
                 return
-            self._ws_server = WebSocketServer(self, port)
+            self._ws_server = WebSocketServer(self._c, port)
             self._ws_server.start()
             self._set_status(f"WebSocket server on port {port}")
         except Exception as e:
@@ -1069,7 +741,7 @@ class MainWindow(QMainWindow):
 
     def _build_sidebar(self, sb):
         # Title
-        title = QLabel("ASI STREAM\nDEMO")
+        title = QLabel("CMOS\nCONTROL")
         title.setStyleSheet("color: #00e87a; font: bold 15pt 'Courier New';")
         title.setAlignment(Qt.AlignCenter)
         sb.addWidget(title)
@@ -1137,7 +809,7 @@ class MainWindow(QMainWindow):
         # Apply
         btn = QPushButton("Apply Settings")
         btn.setStyleSheet("background-color: #1a2a3a;")
-        btn.clicked.connect(lambda: self._apply_settings(silent=False))
+        btn.clicked.connect(self._apply_settings)
         sb.addWidget(btn)
 
         # == Display ==
@@ -1148,6 +820,9 @@ class MainWindow(QMainWindow):
         self._stretch_combo = QComboBox()
         for name in STRETCH_FUNCS:
             self._stretch_combo.addItem(name)
+        self._stretch_combo.currentTextChanged.connect(
+            lambda name: setattr(self._c, "display_stretch", name)
+        )
         row.addWidget(self._stretch_combo)
         gl.addLayout(row)
         sb.addWidget(grp)
@@ -1243,6 +918,8 @@ class MainWindow(QMainWindow):
         sl = QHBoxLayout(bar)
         sl.setContentsMargins(10, 0, 10, 0)
 
+        self._state_lbl = self._stat_label("DISCONNECTED", "#555")
+        sl.addWidget(self._state_lbl)
         self._fps_lbl = self._stat_label("FPS  --", "#00e87a")
         sl.addWidget(self._fps_lbl)
         self._frames_lbl = self._stat_label("Frames  0", "#aaa")
@@ -1319,15 +996,6 @@ class MainWindow(QMainWindow):
         setattr(self, attr, spin)
         return row
 
-    def _roi_full_frame(self):
-        cam = self._camera
-        if not cam:
-            return
-        self._roi_w.setValue(cam.info.max_width)
-        self._roi_h.setValue(cam.info.max_height)
-        self._roi_x.setValue(0)
-        self._roi_y.setValue(0)
-
     def _pick_fits_dir(self):
         current = self._fits_dir.text().strip() or os.getcwd()
         path = QFileDialog.getExistingDirectory(
@@ -1341,11 +1009,7 @@ class MainWindow(QMainWindow):
     # =====================================================================
 
     def closeEvent(self, event):
-        self._stop_stream()
-        self._cooler_timer.stop()
         if self._ws_server:
             self._ws_server.stop()
-        if self._camera:
-            self._camera.close()
-            self._camera = None
+        self._c.shutdown()
         event.accept()
