@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 
 import numpy as np
 
@@ -130,6 +131,13 @@ class QhyCamera:
         self.cooler_on = False
         self.tec_setpoint = 0.0
 
+        # CURPWM readback quirk (measured 2026-08-14, SDK V20260625_16):
+        # the register reads 0 except immediately after a
+        # ControlQHYCCDTemp call. We read it right after each keep-alive
+        # and cache it.
+        self._pwm_cache = None        # (raw 0-255, monotonic time)
+        self._temp_history = []       # last few CURTEMP reads (frozen detect)
+
         self._read_mode = profile.read_mode
         self._sdk_version = sdk.get_sdk_version_string()
 
@@ -232,22 +240,51 @@ class QhyCamera:
 
     # -- thermal ------------------------------------------------------
 
+    def _pwm_after_keepalive_locked(self):
+        """Read CURPWM inside the post-ControlQHYCCDTemp validity window
+        and cache it. Caller must hold self._lock."""
+        pwm = self.sdk.get_param(ControlID.CONTROL_CURPWM, self.handle)
+        if pwm:
+            self._pwm_cache = (float(pwm), time.monotonic())
+        return pwm
+
     def temperature(self) -> float:
-        """Sensor temp [C]; NaN while the readout is untrustworthy
-        (TEC idle: readout frozen at a bogus value while PWM == 0)."""
+        """Sensor temp [C]; NaN only while the readout is provably frozen.
+
+        With regulation active the readout is live. When the TEC is idle
+        the readout can freeze at a bogus value (HANDOFF §7); the frozen
+        state is detected by its signature -- several consecutive reads
+        EXACTLY identical -- rather than by CURPWM, whose readback is
+        itself unreliable (reads 0 except right after ControlQHYCCDTemp).
+        """
         with self._lock:
-            pwm = self.sdk.get_param(ControlID.CONTROL_CURPWM, self.handle)
-            if not pwm:   # None or 0
-                return float("nan")
             t = self.sdk.get_param(ControlID.CONTROL_CURTEMP, self.handle)
-        return float(t) if t is not None else float("nan")
+        if t is None:
+            return float("nan")
+        t = float(t)
+        if self.cooler_on:
+            self._temp_history.clear()
+            return t
+        self._temp_history.append(t)
+        del self._temp_history[:-4]
+        if (len(self._temp_history) >= 4
+                and len(set(self._temp_history)) == 1):
+            return float("nan")   # frozen readout
+        return t
 
     def cooler_power(self):
         with self._lock:
             pwm = self.sdk.get_param(ControlID.CONTROL_CURPWM, self.handle)
-        if pwm is None:
-            return None
-        return float(pwm) / 255.0 * 100.0
+        if pwm:
+            self._pwm_cache = (float(pwm), time.monotonic())
+            return float(pwm) / 255.0 * 100.0
+        # Raw readback is 0 almost always; fall back to the value cached
+        # right after the last keep-alive.
+        if self.cooler_on and self._pwm_cache:
+            val, when = self._pwm_cache
+            if time.monotonic() - when < 20.0:
+                return val / 255.0 * 100.0
+        return 0.0
 
     def set_cooler(self, on: bool, target_c: float = 0.0):
         lo, hi = self.profile.tec_setpoint_range
@@ -257,14 +294,18 @@ class QhyCamera:
         with self._lock:
             if on:
                 self.sdk.control_temp(target_c, self.handle)
+                self._pwm_after_keepalive_locked()
             else:
                 self.sdk.set_param(ControlID.CONTROL_MANULPWM, 0, self.handle)
+                self._pwm_cache = None
 
     def thermal_keepalive(self):
-        """Re-issue the TEC setpoint (cheap; keeps regulation engaged)."""
+        """Re-issue the TEC setpoint (cheap; keeps regulation engaged)
+        and grab CURPWM inside its post-call validity window."""
         if self.cooler_on:
             with self._lock:
                 self.sdk.control_temp(self.tec_setpoint, self.handle)
+                self._pwm_after_keepalive_locked()
 
     # -- misc ---------------------------------------------------------
 

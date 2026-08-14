@@ -521,15 +521,15 @@ class CameraController(QObject):
         if not cam or not cam.info.is_cooler:
             return False
         try:
+            # Keep-alive FIRST: QHY TEC regulation needs it periodically,
+            # and its CURPWM readback is only valid right after the call.
+            cam.thermal_keepalive()
             t = cam.temperature()
-            if t == t:   # not NaN (QHY readout is bogus while PWM == 0)
+            if t == t:   # not NaN (frozen-readout guard)
                 self._last_temp = t
             p = cam.cooler_power()
             if p is not None:
                 self._last_power = float(p)
-            # QHY TEC regulation needs a periodic keep-alive even when
-            # nothing is streaming.
-            cam.thermal_keepalive()
             return t == t
         except Exception:
             return False

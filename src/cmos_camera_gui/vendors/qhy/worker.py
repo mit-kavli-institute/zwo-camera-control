@@ -299,5 +299,13 @@ class QhyCaptureWorker(QObject):
                 ro_vals[name] = self.camera.get_ctrl_value(ct)
             except Exception:
                 pass
+        # Cooler power for the controller cache / GUI readout (uses the
+        # post-keepalive CURPWM cache; the raw register mostly reads 0).
+        try:
+            p = self.camera.cooler_power()
+            if p is not None:
+                ro_vals["CoolerPowerPerc"] = p
+        except Exception:
+            pass
         if ro_vals:
             self.readonly_update.emit(ro_vals)
