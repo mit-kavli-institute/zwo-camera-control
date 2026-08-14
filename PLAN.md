@@ -311,7 +311,74 @@ refresh, merge to main.
 - **Hardware checklists** (manual, scripted via `client.py`): HANDOFF §10 for
   QHY; current behavior snapshot for ZWO.
 
-## 10. Decisions taken (flag if you disagree)
+## 10. WSP / SUMMER integration (TCS compliance)
+
+This GUI is the **SUMMER camera GUI** for WSP (contract:
+`observatory/docs/SummerCameraGuiHandoff.md`; ground truth:
+`spring_camera_daemon.py`, `daemon_framework.py`, interface-test notebook).
+Strategy per the handoff: *reshape, don't adapt* — implement the contract as
+new server verbs beside the existing ones, plus a `SummerClient` with the
+pirtcam method names, so the summer daemon stays a near-copy of spring's.
+
+**Already satisfied by the architecture:** GUI owns hardware & writes FITS;
+runs with or without a client; header triple passthrough with caller-wins;
+abrupt-disconnect tolerance, multi-connection, idempotent connect;
+`is_capturing`'s underlying facts (R1: `_record_pending` is set synchronously
+at command accept; R2: EXPOSING→SAVING until the writer's done-callback);
+TEC runs unattended with keep-alive; `tec_locked` = threshold+dwell stability.
+
+**Gap list (implementation plan):**
+- **G1 — WSP verbs** `get_status` (spring's `{"status","data":{...}}` shape),
+  `set_exposure` (float SECONDS), `set_save_path` (`~` expansion, mkdir),
+  `capture` (ack-only, no record_done push — daemon detects completion by
+  polling), `set_tec_enabled`, `set_tec_temperature`; replies
+  `{"status": "success"|"error", "message"}`.
+- **G2 — exposure echo:** store the requested float seconds; convert to µs
+  internally; echo the exact float in status (`exposure_actual` extra for the
+  quantized value). Daemon does a float == test.
+- **G3 — R3 output:** WSP capture path writes `<save_path>/<filename>.fits`
+  as a single **2D** image HDU (squeeze n=1; GPS metadata as primary-header
+  cards, no FRAMEMETA extension); write to temp name + atomic rename so a
+  failed capture never leaves a partial file at the target path.
+- **G4 — status snapshot keys:** is_capturing, ready, current_frame,
+  total_frames, capture_time_remaining, exposure, save_path, tec_temp,
+  tec_setpoint, tec_enabled, tec_locked (0/1), `tec_voltage: -888` +
+  `tec_power_pct` (QHY has PWM only; summer daemon overrides the voltage
+  getters), `case_temp/digpcb_temp/senspcb_temp: -888` (+ QHY
+  humidity/pressure as extras if available).
+- **G5 — state mapping:** report SETTING_EXPOSURE between set_exposure accept
+  and hardware apply (usually instant; staged-in-idle counts as applied);
+  SAVING maps into is_capturing anyway; READY as-is.
+- **G6 — `SummerClient`** (separate class; our CameraClient.capture_frames has
+  a different signature) with pirtcam method names over the WS transport.
+- **G7 — instrument naming:** configurable instrument name (`summer`) for
+  INSTRUME/status `camname`/default dirs, via config file.
+- **G8 — failure path:** FITS save error latches ERROR state (is_capturing
+  drops false, state != READY, no partial file per G3).
+- **G9 — status never touches SDK:** serve `get_status` purely from the
+  telemetry cache (move the idle-path SDK reads out of thermal_status; the
+  2 s timer refreshes the cache).
+- **G10 — headless/service mode:** `--headless` (controller + WS server, no
+  window) for autostart robustness.
+- **G11 — config file:** port (proposal 5566), instrument name, TEC defaults.
+- **G12 — DATE-OBS/UTCSHUT camera-truth cards** — same work as the deferred
+  required-header item; GPS-locked time when available, host UTC otherwise,
+  with TIMESRC recording which.
+
+**Flagged / unclear (need user or ops decision):**
+- **U1:** `nframes > 1` naming for WSP is explicitly out of scope (daemon
+  always sends 1); local multi-frame keeps cube/indiv behavior.
+- **U2:** TEC warm-up ramp at shutdown — spring waits for >-45 °C; QHY off is
+  instant (MANULPWM=0). Does the GSENSE400BSI need a ramped warm-up? No
+  guidance in HANDOFF; check with QHY docs / sensor datasheet.
+- **U3:** TEC_SETTLING remains visible in camera_state (same as pirt): a
+  set_exposure issued while the TEC is re-settling mid-night stalls its
+  completion check until READY returns — identical to spring's behavior, but
+  worth knowing operationally.
+- **U4:** confirm SUMMER == this QHY42 system (naming assumption), and which
+  machine runs the GUI as an autostart service.
+
+## 11. Decisions taken (flag if you disagree)
 
 - TEC "settled" = **threshold + dwell** (`|temp − setpoint| ≤ tolerance` held
   for `dwell_s`), with hysteresis; slope is used only for long-timescale
