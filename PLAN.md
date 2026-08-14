@@ -273,17 +273,19 @@ only `backend.thermal()` samples):
 
 ## 8. Phased execution (each phase leaves a working app)
 
-**Status (2026-08-14):** Phases 0-1 done and hardware-validated (ASI294).
-Phase 2 landed in a pragmatic form: instead of a formal Qt-free
-`CameraBackend` ABC, vendors are duck-typed adapters + per-vendor capture
-workers under `vendors/{zwo,qhy}/` with a registry, the SDK-thread-owns-
-everything contract, the shared `RecordGate`, per-vendor profiles
-(defaults, TEC tuning), capability flags driving the GUI, vendor run
-header cards (`DATASEC`, `GPSROW0`, ...), and per-frame metadata
-(FRAMEMETA bintable / GPS cards) — i.e. Phase 3's header essentials came
-along. The formal ABC + full required-header validation remain future
-polish. Phase 4 (QHY) is code-complete per HANDOFF; hardware validation
-pending (drop `qhyccd.dll` into `sdk/`).
+**Status (2026-08-14, end of day):** Phases 0-1 done, hardware-validated
+(ASI294). Phase 2 landed pragmatically (duck-typed vendor adapters +
+per-vendor workers + registry + RecordGate + profiles, not a formal
+Qt-free ABC). Phase 3 essentials landed (vendor run cards incl. DATASEC/
+GPSROW0, FRAMEMETA bintable, per-frame GPS cards, combine headers);
+required-minimum-set validation still open (missing: DATE-OBS, CAMID,
+XBINNING, SWCREATE, TIMESYS/TIMESRC). Phase 4 (QHY42PRO) hardware-
+validated end to end: stream, gated grabs with consecutive GPS seqs,
+TEC (with measured CURPWM-readback quirk handled), high-speed idle mode;
+grab floor T+~65-100 ms confirmed in both idle modes. Open: GPS-locked
+validation (needs antenna), QHY ROI/binning untested, committed pytest
+suite (tests currently live in session scratchpad), README/examples
+refresh, merge to main.
 
 | Phase | Work | Risk / validation |
 |---|---|---|
