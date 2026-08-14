@@ -281,6 +281,12 @@ class CameraController(QObject):
             return {}
         return self._camera.capabilities()
 
+    def advanced_control_names(self) -> set:
+        """Controls the GUI should tuck into the Advanced dialog."""
+        if not self._vendor:
+            return set()
+        return set(self._vendor.profile.advanced_controls)
+
     def connect_camera(self, index: int):
         if not self.sdk_loaded:
             raise RuntimeError("SDK not loaded")

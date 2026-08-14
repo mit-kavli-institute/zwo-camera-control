@@ -19,7 +19,7 @@ import time
 
 from PyQt5.QtCore import Qt, QTimer, pyqtSlot
 from PyQt5.QtWidgets import (
-    QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox,
+    QButtonGroup, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
     QFileDialog, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QProgressBar, QPushButton, QRadioButton,
     QScrollArea, QSlider, QSpinBox, QSplitter,
@@ -286,6 +286,7 @@ class MainWindow(QMainWindow):
 
         self._c = controller
         self._ctrl_widgets = {}    # name -> ControlWidget
+        self._adv_dialog = None    # Advanced-controls dialog
         self._last_raw_frame = None
 
         self._build_ui()
@@ -423,17 +424,46 @@ class MainWindow(QMainWindow):
             return
 
         layout = self._ctrl_group.layout()
+        advanced_names = self._c.advanced_control_names()
 
-        # Writable controls
-        for spec in cs.writable():
+        def _make_widget(spec, into_layout):
             w = ControlWidget(spec, on_change=self._c.stage_control)
-            layout.addWidget(w)
+            into_layout.addWidget(w)
             self._ctrl_widgets[spec.name] = w
             # Reflect any value already staged in the controller (e.g.
             # BandWidth override applied at connect, or remote edits).
             val = self._c.settings.get(spec.name)
             if val is not None and val != w.get_value():
                 w.set_value(val)
+
+        writable = cs.writable()
+        basic = [s for s in writable if s.name not in advanced_names]
+        advanced = [s for s in writable if s.name in advanced_names]
+
+        for spec in basic:
+            _make_widget(spec, layout)
+
+        # Advanced controls live in a separate dialog (rarely touched;
+        # still fully reachable via the remote `set` verb).
+        if advanced:
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Advanced Controls")
+            dlg.setMinimumWidth(320)
+            dl = QVBoxLayout(dlg)
+            note = QLabel(
+                "Rarely-needed plumbing controls. Change only with reason;\n"
+                "values are recorded in every FITS header."
+            )
+            note.setStyleSheet("color: #888; font: 8pt 'Courier New';")
+            dl.addWidget(note)
+            for spec in advanced:
+                _make_widget(spec, dl)
+            self._adv_dialog = dlg
+
+            btn = QPushButton("Advanced...")
+            btn.setStyleSheet("color: #888;")
+            btn.clicked.connect(self._show_advanced)
+            layout.addWidget(btn)
 
         # Read-only controls
         ro = cs.readonly()
@@ -447,6 +477,11 @@ class MainWindow(QMainWindow):
                 layout.addWidget(w)
                 self._ctrl_widgets[spec.name] = w
 
+    def _show_advanced(self):
+        if self._adv_dialog:
+            self._adv_dialog.show()
+            self._adv_dialog.raise_()
+
     def _clear_controls_panel(self):
         layout = self._ctrl_group.layout()
         while layout.count():
@@ -454,6 +489,9 @@ class MainWindow(QMainWindow):
             widget = item.widget()
             if widget:
                 widget.deleteLater()
+        if self._adv_dialog:
+            self._adv_dialog.deleteLater()
+            self._adv_dialog = None
         self._ctrl_widgets.clear()
 
     def _on_remote_control_changed(self, name: str, value: int):

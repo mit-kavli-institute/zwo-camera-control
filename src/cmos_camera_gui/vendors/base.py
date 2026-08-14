@@ -40,6 +40,10 @@ class VendorProfile:
     # Overrides for SDK-reported control defaults ({control_name: value}).
     default_overrides: dict = {}
 
+    # Controls tucked away in the GUI's Advanced dialog (rarely touched;
+    # still fully available via the remote `set` verb).
+    advanced_controls: set = set()
+
     # TEC settle/stall detection tuning (core.thermal).
     tec_config = TecConfig()
 

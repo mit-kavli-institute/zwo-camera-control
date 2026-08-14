@@ -54,8 +54,12 @@ class QhyProfile(VendorProfile):
         "Gain": "sensor gain",
         "Offset": "ADC offset (pedestal)",
         "Exposure": "exposure time [us]",
-        "UsbTraffic": "USB traffic setting (lower = faster)",
+        "UsbTraffic": "USB traffic setting (lower = faster). Measured "
+                      "2026-08-14: no effect on this readout-limited "
+                      "camera (42 ms/frame at every value, 0 drops); "
+                      "raise it only if a weak USB path drops frames.",
     }
+    advanced_controls = {"UsbTraffic"}
     # QHY TEC is coarse (bad PID): loose tolerance, longer dwell
     tec_config = TecConfig(tolerance_c=1.5, dwell_s=45.0)
     # Measured overhead beyond one exposure in the live-stream cadence

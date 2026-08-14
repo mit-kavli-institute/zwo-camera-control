@@ -32,6 +32,8 @@ class ZwoProfile(VendorProfile):
     }
     tec_config = TecConfig(tolerance_c=0.7, dwell_s=30.0)
     cadence_overhead_s = 0.4   # full-frame readout+transfer, measured ASI294
+    # USB/readout plumbing: rarely touched, hidden in the Advanced dialog
+    advanced_controls = {"BandWidth", "HighSpeedMode"}
 
     def post_connect(self, settings) -> None:
         # Max out USB bandwidth for streaming
