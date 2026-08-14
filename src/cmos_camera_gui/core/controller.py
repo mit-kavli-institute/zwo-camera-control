@@ -81,6 +81,7 @@ class CameraController(QObject):
         # Canonical acquisition geometry/format (GUI widgets mirror these)
         self.roi = {"x": 0, "y": 0, "w": 0, "h": 0}
         self.img_type = "RAW16"
+        self._applied_roi = None  # last (x,y,w,h,img_type) pushed to hardware
 
         # Canonical record parameters (GUI widgets mirror these)
         self.record_params = {
@@ -228,6 +229,13 @@ class CameraController(QObject):
             return
         self._recompute_state(transient=CameraState.INITIALIZING)
         try:
+            # Enumeration must precede GetCameraProperty (SDK requirement),
+            # so connect works even without a prior list_cameras() call.
+            n = self._driver.get_num_cameras()
+            if not 0 <= index < n:
+                raise RuntimeError(
+                    f"camera index {index} out of range ({n} camera(s) found)"
+                )
             self._camera = ASICamera(self._driver, index)
             cam = self._camera
 
@@ -290,6 +298,7 @@ class CameraController(QObject):
         self._settings = None
         self._cooler_on = False
         self._error_msg = None
+        self._applied_roi = None
         self.tec_monitor.reset()
         self._recompute_state()
         self.connected_changed.emit(False)
@@ -364,10 +373,16 @@ class CameraController(QObject):
             raise RuntimeError("no camera connected")
 
         img_type = ImgType.RAW16 if self.img_type == "RAW16" else ImgType.RAW8
-        cam.set_roi(
-            self.roi["w"], self.roi["h"], 1, img_type,
-            self.roi["x"], self.roi["y"],
-        )
+        # Only touch the ROI when it actually changed: ASISetROIFormat
+        # mid-stream stalls the video pipeline for seconds (measured).
+        roi_key = (self.roi["x"], self.roi["y"], self.roi["w"], self.roi["h"],
+                   self.img_type)
+        if roi_key != self._applied_roi:
+            cam.set_roi(
+                self.roi["w"], self.roi["h"], 1, img_type,
+                self.roi["x"], self.roi["y"],
+            )
+            self._applied_roi = roi_key
         errors = self._settings.apply(cam)
 
         if not silent:

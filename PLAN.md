@@ -125,7 +125,18 @@ class CameraBackend(ABC):
 Backend-internal, invisible to the controller:
 
 - **ZwoBackend:** current `CaptureWorker` loop, minus Qt (plain thread +
-  queues); record = flag next N stream frames as kept.
+  queues); record = flag next N stream frames as kept — **after an
+  inter-arrival delta gate discards in-flight frames**. Measured on the
+  ASI294MM Pro (2026-08-14): the SDK buffers 1–2 frames exposed *before*
+  the record command, so a `set Exposure` + `record` sweep records its
+  first frame(s) at the OLD exposure — the ZWO analog of the QHY
+  transition-frame problem. Gate: keep only frames with
+  `0.8×T ≤ delta ≤ T + readout_margin`, unifying both vendors on the
+  handoff's "every kept exposure starts after the grab command" rule.
+  (Side effect: EXPOSING then genuinely spans N fresh exposures, matching
+  operator intuition.) Also measured: sub-frame ROIs (e.g. 1024×1024
+  RAW16) stall the ASI294 stream for seconds at a time — a camera/SDK
+  quirk to document, not code around.
 - **QhyBackend:** HANDOFF recipe verbatim — init order (read mode → stream
   mode → InitQHYCCD → bits → effective area → params → GPS on → DDR on),
   stale-DDR drain after `BeginQHYCCDLive`, reusable frame buffer, the

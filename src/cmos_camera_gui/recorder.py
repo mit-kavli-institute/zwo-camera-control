@@ -69,7 +69,8 @@ def save_fits_cube(path, cube, metadata, on_done):
                 hdr[k] = v
             hdr["BUNIT"] = "ADU"
             elapsed = _scalar(metadata.get("ELAPSED", 0))
-            hdr["COMMENT"] = "ZWO ASI streaming demo cube"
+            # FITS headers must be printable ASCII -- no unicode dashes etc.
+            hdr["COMMENT"] = "CMOS Control GUI frame cube"
             hdr["COMMENT"] = (
                 f"Recorded {cube.shape[0]} frames in {elapsed:.3f}s"
             )
@@ -124,7 +125,8 @@ def save_fits_individual(directory, basename, cube, timestamps, metadata, on_don
                 hdr["FRAME_ID"] = (int(i), "frame index within the series")
                 hdr["TIMESTMP"] = (float(ts_arr[i]), "[s] since recording start")
                 hdr["DELTA_T"] = (float(dt_arr[i]), "[s] since previous frame")
-                hdr["COMMENT"] = "ZWO ASI streaming demo — individual frame"
+                # FITS headers must be printable ASCII -- no unicode dashes
+                hdr["COMMENT"] = "CMOS Control GUI individual frame"
 
                 path = os.path.join(
                     directory, f"{basename}_{i:0{width}d}.fits"
