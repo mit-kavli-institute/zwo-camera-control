@@ -309,14 +309,26 @@ class CameraController(QObject):
     # =================================================================
 
     def stage_control(self, name: str, value) -> bool:
-        """Stage a control value (GUI-origin; no control_changed echo)."""
+        """Stage a control value and push it to the camera immediately
+        (GUI-origin; no control_changed echo).
+
+        Live-apply keeps GUI edits and remote `set` commands equivalent:
+        what the controls show is what the hardware runs. Geometry
+        (ROI/img_type) is deliberately excluded — it goes through
+        apply_settings because mid-stream ROI pushes stall the stream.
+        """
         if not self._settings:
             return False
         try:
             self._settings.set(name, value, clamp=True)
-            return True
         except Exception:
             return False
+        if self._camera:
+            try:
+                self._settings.apply_one(self._camera, name)
+            except Exception as e:
+                log.debug("live-apply %s failed: %s", name, e)
+        return True
 
     def set_control(self, name: str, value) -> bool:
         """Stage a control value (remote-origin; echoes to the GUI)."""
@@ -534,6 +546,10 @@ class CameraController(QObject):
         if param_overrides:
             self.set_record_params(**param_overrides)
         n = int(self.record_params["n_frames"])
+
+        # A record must always run with the currently staged settings,
+        # regardless of which surface staged them (GUI widget, remote set).
+        self.apply_settings(silent=True)
 
         cam = self._camera
         w, h, _bin, img_t = cam.get_roi()

@@ -145,6 +145,9 @@ class ControlWidget(QWidget):
 
             exp_spin = QDoubleSpinBox()
             exp_spin.setDecimals(3)
+            # Fire only on Enter/focus-out/arrows — controls live-apply to
+            # the camera, so per-keystroke values (1, 10, 100...) must not.
+            exp_spin.setKeyboardTracking(False)
             exp_spin.setStyleSheet(
                 "color: #00e87a; font: bold 9pt 'Courier New'; "
                 "background: #1a1a1a; border: 1px solid #333;"
@@ -192,6 +195,7 @@ class ControlWidget(QWidget):
         if use_slider:
             # Spinbox in header for typed input, synced bidirectionally with slider
             val_spin = QSpinBox()
+            val_spin.setKeyboardTracking(False)
             val_spin.setRange(s.min_value, s.max_value)
             val_spin.setValue(s.default_value)
             val_spin.setFixedWidth(70)
@@ -221,6 +225,7 @@ class ControlWidget(QWidget):
             layout.addLayout(hdr)
 
             spin = QSpinBox()
+            spin.setKeyboardTracking(False)
             spin.setRange(s.min_value, s.max_value)
             spin.setValue(s.default_value)
             inc = max(1, rng // 1000)
