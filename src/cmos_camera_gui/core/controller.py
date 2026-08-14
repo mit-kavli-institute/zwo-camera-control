@@ -93,6 +93,8 @@ class CameraController(QObject):
             "directory": os.getcwd(),
             "basename": "capture",
             "mode": "stack",        # "stack" | "individual"
+            "combine": "none",      # "none" | "mean" | "median"
+            "combine_only": False,  # skip cube/frames, keep combined only
         }
 
         # Display metadata contributed by the GUI (kept in FITS header)
@@ -610,6 +612,14 @@ class CameraController(QObject):
         mode = self.record_params["mode"]
         if mode not in ("stack", "individual"):
             raise ValueError(f"mode must be stack|individual, got {mode!r}")
+        combine = self.record_params["combine"]
+        if combine not in ("none", "mean", "median"):
+            raise ValueError(
+                f"combine must be none|mean|median, got {combine!r}"
+            )
+        self.record_params["combine_only"] = bool(
+            self.record_params["combine_only"]
+        )
         if notify:
             self.record_params_changed.emit()
 
@@ -728,6 +738,8 @@ class CameraController(QObject):
         directory = str(self.record_params["directory"]) or os.getcwd()
         basename = str(self.record_params["basename"]) or "capture"
         stack_mode = self.record_params["mode"] == "stack"
+        combine = self.record_params["combine"]
+        combine_only = bool(self.record_params["combine_only"])
 
         self._saving = True
         self._recompute_state()
@@ -749,10 +761,12 @@ class CameraController(QObject):
 
         if stack_mode:
             path = os.path.join(directory, f"{basename}.fits")
-            save_fits_cube(path, cube, meta, _after_save)
+            save_fits_cube(path, cube, meta, _after_save,
+                           combine=combine, combine_only=combine_only)
         else:
             save_fits_individual(
-                directory, basename, cube, timestamps, meta, _after_save
+                directory, basename, cube, timestamps, meta, _after_save,
+                combine=combine, combine_only=combine_only,
             )
 
     # =================================================================
@@ -868,6 +882,10 @@ class CameraController(QObject):
                 params["basename"] = str(cmd["basename"])
             if "mode" in cmd:
                 params["mode"] = str(cmd["mode"]).lower()
+            if "combine" in cmd:
+                params["combine"] = str(cmd["combine"]).lower()
+            if "combine_only" in cmd:
+                params["combine_only"] = bool(cmd["combine_only"])
 
             try:
                 self.start_record(
@@ -883,6 +901,8 @@ class CameraController(QObject):
                 "directory": self.record_params["directory"],
                 "basename": self.record_params["basename"],
                 "mode": self.record_params["mode"],
+                "combine": self.record_params["combine"],
+                "combine_only": self.record_params["combine_only"],
             }
 
         elif action == "abort":

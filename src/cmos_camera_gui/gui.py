@@ -633,6 +633,8 @@ class MainWindow(QMainWindow):
             directory=self._fits_dir.text().strip() or os.getcwd(),
             basename=self._fits_basename.text().strip() or "capture",
             mode="stack" if self._mode_stack_rb.isChecked() else "individual",
+            combine=self._combine_combo.currentText().lower(),
+            combine_only=self._combine_only_cb.isChecked(),
             notify=False,
         )
 
@@ -645,6 +647,9 @@ class MainWindow(QMainWindow):
             self._mode_stack_rb.setChecked(True)
         else:
             self._mode_indiv_rb.setChecked(True)
+        idx = {"none": 0, "mean": 1, "median": 2}.get(str(p["combine"]), 0)
+        self._combine_combo.setCurrentIndex(idx)
+        self._combine_only_cb.setChecked(bool(p["combine_only"]))
 
     def _start_record(self):
         self._push_record_params()
@@ -889,6 +894,26 @@ class MainWindow(QMainWindow):
         mode_row.addWidget(self._mode_stack_rb)
         mode_row.addWidget(self._mode_indiv_rb)
         gl.addLayout(mode_row)
+
+        # Combined (mean/median) frame output
+        comb_row = QHBoxLayout()
+        comb_lbl = QLabel("Combine")
+        comb_lbl.setStyleSheet("color: #888; font: 9pt 'Courier New';")
+        comb_row.addWidget(comb_lbl)
+        self._combine_combo = QComboBox()
+        for name in ("None", "Mean", "Median"):
+            self._combine_combo.addItem(name)
+        self._combine_combo.setToolTip(
+            "Additionally save a combined float32 frame "
+            "({basename}_mean.fits / _median.fits)"
+        )
+        comb_row.addWidget(self._combine_combo, stretch=1)
+        self._combine_only_cb = QCheckBox("only")
+        self._combine_only_cb.setToolTip(
+            "Save only the combined frame; skip the full stack"
+        )
+        comb_row.addWidget(self._combine_only_cb)
+        gl.addLayout(comb_row)
 
         self._rec_btn = QPushButton("⬤  Record FITS")
         self._rec_btn.setStyleSheet("background-color: #3a1a2a;")

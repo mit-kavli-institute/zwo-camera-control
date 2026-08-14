@@ -181,6 +181,8 @@ class CameraClient(AbstractContextManager):
         mode: str = "stack",
         obstype: Optional[str] = None,
         extra_headers: Optional[HeaderLike] = None,
+        combine: str = "none",
+        combine_only: bool = False,
         timeout: float = 600.0,
     ) -> Dict[str, Any]:
         """
@@ -204,6 +206,13 @@ class CameraClient(AbstractContextManager):
               - iterable of ``(key, value)`` / ``(key, value, comment)``
               - iterable of ``astropy.io.fits.Card`` objects
             Applied *after* the auto-filled metadata, so these win on collision.
+        combine : {"none", "mean", "median"}
+            Additionally save a combined float32 frame
+            (``{basename}_mean.fits`` / ``_median.fits``, with
+            NCOMBINE/COMBINED headers).
+        combine_only : bool
+            With combine set: save only the combined frame, skip the full
+            stack/individual files.
 
         Returns
         -------
@@ -218,6 +227,10 @@ class CameraClient(AbstractContextManager):
         """
         if mode not in ("stack", "individual"):
             raise ValueError(f"mode must be 'stack' or 'individual', got {mode!r}")
+        if combine not in ("none", "mean", "median"):
+            raise ValueError(
+                f"combine must be 'none', 'mean' or 'median', got {combine!r}"
+            )
 
         cmd: Dict[str, Any] = {"cmd": "record", "n_frames": int(n_frames), "mode": mode}
         if directory is not None:
@@ -228,6 +241,8 @@ class CameraClient(AbstractContextManager):
             cmd["obstype"] = str(obstype)
         if extra_headers is not None:
             cmd["extra_headers"] = _normalize_headers(extra_headers)
+        cmd["combine"] = combine
+        cmd["combine_only"] = bool(combine_only)
 
         ack = self._send(cmd)  # immediate ack
         done = self._recv(timeout=timeout)  # record_done from save thread
@@ -248,6 +263,8 @@ class CameraClient(AbstractContextManager):
         stack: bool = True,
         obstype: Optional[str] = None,
         extra_headers: Optional[HeaderLike] = None,
+        combine: str = "none",
+        combine_only: bool = False,
         timeout: float = 600.0,
     ) -> Dict[str, Any]:
         """
@@ -258,7 +275,8 @@ class CameraClient(AbstractContextManager):
         watching the GUI keeps their live preview. Call `stop_stream()`
         yourself when you're done.
 
-        See `record()` for `obstype` and `extra_headers`.
+        See `record()` for `obstype`, `extra_headers`, `combine`,
+        `combine_only`.
         """
         if not self.status().get("streaming", False):
             self.start_stream()
@@ -269,6 +287,8 @@ class CameraClient(AbstractContextManager):
             mode="stack" if stack else "individual",
             obstype=obstype,
             extra_headers=extra_headers,
+            combine=combine,
+            combine_only=combine_only,
             timeout=timeout,
         )
 
