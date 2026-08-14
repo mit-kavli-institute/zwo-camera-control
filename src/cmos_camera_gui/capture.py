@@ -25,6 +25,11 @@ class CaptureWorker(QObject):
     """
     Runs ASIGetVideoData in a tight loop.
 
+    This thread is the sole owner of the SDK while streaming: the SDK
+    serializes calls per camera, so any call from another thread would
+    block for up to one exposure. Other threads submit work via
+    ``run_async`` and consume the readonly/stats signals instead.
+
     Frame delivery
     --------------
     Frames are pushed to ``frame_queue`` (Queue(maxsize=2)) and the GUI
@@ -34,6 +39,8 @@ class CaptureWorker(QObject):
     ----------------------------
     stats_update(fps, total_frames, dropped, sensor_temp_C)
         Emitted every ~500 ms.
+    readonly_update(dict)
+        {control_name: raw_value} for the readonly controls, every ~500 ms.
     recording_progress(n_got, n_target)
         Emitted at ~10 Hz during recording.
     recording_done(cube, timestamps, elapsed)
@@ -43,19 +50,25 @@ class CaptureWorker(QObject):
     """
 
     stats_update = pyqtSignal(float, int, int, float)
+    readonly_update = pyqtSignal(object)
     recording_progress = pyqtSignal(int, int)
     recording_done = pyqtSignal(object, object, float)
     error = pyqtSignal(str)
 
-    def __init__(self, camera, exposure_ms):
+    def __init__(self, camera, exposure_ms, readonly_ctrls=None):
         super().__init__()
         self.camera = camera
         self.exposure_ms = exposure_ms
+        # {name: control_type} of readonly controls to poll with stats
+        self._readonly_ctrls = dict(readonly_ctrls or {})
         self._stop = threading.Event()
 
         # Frame delivery: GUI polls this queue with a QTimer.
         # maxsize=2 means at most 2 frames buffered; overflow is dropped.
         self.frame_queue = queue.Queue(maxsize=2)
+
+        # SDK work submitted from other threads; drained between frames.
+        self._cmd_queue = queue.Queue()
 
         # Recording state (guarded by lock)
         self._rec_lock = threading.Lock()
@@ -67,6 +80,25 @@ class CaptureWorker(QObject):
 
     def request_stop(self):
         self._stop.set()
+
+    def run_async(self, fn):
+        """Run fn on the capture thread between frames. Thread-safe.
+
+        This is how other threads touch the SDK while streaming without
+        blocking on the in-flight ASIGetVideoData call.
+        """
+        self._cmd_queue.put(fn)
+
+    def _drain_cmds(self):
+        while True:
+            try:
+                fn = self._cmd_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                fn()
+            except Exception as exc:
+                self.error.emit(f"deferred SDK call failed: {exc}")
 
     def start_recording(self, n_frames, width, height, dtype):
         """Begin recording into a pre-allocated cube. Thread-safe."""
@@ -112,6 +144,7 @@ class CaptureWorker(QObject):
         cam.start_video()
         try:
             while not self._stop.is_set():
+                self._drain_cmds()
                 rc = drv.get_video_data_raw(cid, c_buf, buf_size, timeout_ms)
 
                 if rc == ASI_ERROR_TIMEOUT:
@@ -189,6 +222,17 @@ class CaptureWorker(QObject):
                     except ASIError:
                         temp = float("nan")
                     self.stats_update.emit(fps, total, dropped, temp)
+
+                    # Readonly control values, gathered here so no other
+                    # thread ever needs to call into the SDK for them.
+                    ro_vals = {}
+                    for name, ct in self._readonly_ctrls.items():
+                        try:
+                            ro_vals[name] = cam.get_ctrl_value(ct)
+                        except Exception:
+                            pass
+                    if ro_vals:
+                        self.readonly_update.emit(ro_vals)
 
         finally:
             cam.stop_video()

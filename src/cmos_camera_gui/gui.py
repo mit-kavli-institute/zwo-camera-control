@@ -324,6 +324,7 @@ class MainWindow(QMainWindow):
         c.record_finished.connect(self._on_record_finished)
         c.record_cancelled.connect(self._on_record_cancelled)
         c.stats_update.connect(self._on_stats)
+        c.readonly_update.connect(self._on_readonly_update)
         c.thermal_update.connect(self._on_thermal_update)
 
         self._on_state_changed(c.camera_state.name)
@@ -600,8 +601,9 @@ class MainWindow(QMainWindow):
         if not math.isnan(temp):
             self._temp_lbl.setText(f"{temp:.1f} C")
 
-        # Update readonly control widgets (temperature, cooler power, etc.)
-        for name, val in self._c.readonly_values().items():
+    def _on_readonly_update(self, ro_vals: dict):
+        """Readonly control values pushed by the capture thread."""
+        for name, val in ro_vals.items():
             w = self._ctrl_widgets.get(name)
             if w:
                 w.update_readonly(val)

@@ -63,8 +63,12 @@ class CameraController(QObject):
     record_finished = pyqtSignal(str)            # save-result message
     record_cancelled = pyqtSignal()
     stats_update = pyqtSignal(float, int, int, float)  # fps, total, dropped, temp
+    readonly_update = pyqtSignal(object)         # {name: raw_value} from worker
     thermal_update = pyqtSignal(float, float)    # temp_C, power_pct
     error = pyqtSignal(str)
+
+    # Internal: emitted from the capture thread once a record is armed.
+    _record_armed = pyqtSignal(int)
 
     def __init__(self, sdk_path=None, parent=None):
         super().__init__(parent)
@@ -108,8 +112,16 @@ class CameraController(QObject):
         self._record_done_cb = None
 
         self._saving = False
+        self._record_pending = False   # record armed on capture thread
         self._error_msg = None      # latched -> CameraState.ERROR
         self._state = CameraState.DISCONNECTED
+
+        # Thermal telemetry cache, fed by the capture thread while
+        # streaming so nothing else has to call into the SDK.
+        self._last_temp = None
+        self._last_power = 0.0
+
+        self._record_armed.connect(self._on_record_armed)
 
         # Thermal poll (runs while connected on cooled cameras)
         self._thermal_timer = QTimer(self)
@@ -147,6 +159,8 @@ class CameraController(QObject):
             self.state_changed.emit(new.name)
 
     def _recording_active(self) -> bool:
+        if self._record_pending:
+            return True
         if not self._worker:
             return False
         with self._worker._rec_lock:
@@ -323,12 +337,29 @@ class CameraController(QObject):
             self._settings.set(name, value, clamp=True)
         except Exception:
             return False
-        if self._camera:
+        self._push_control(name)
+        return True
+
+    def _push_control(self, name: str):
+        """Push one staged control to hardware without blocking the caller.
+
+        While streaming the capture thread owns the SDK (calls from other
+        threads block for up to one exposure), so the push is queued there.
+        """
+        cam, settings = self._camera, self._settings
+        if not cam or not settings:
+            return
+
+        def _do():
             try:
-                self._settings.apply_one(self._camera, name)
+                settings.apply_one(cam, name)
             except Exception as e:
                 log.debug("live-apply %s failed: %s", name, e)
-        return True
+
+        if self._streaming and self._worker:
+            self._worker.run_async(_do)
+        else:
+            _do()
 
     def set_control(self, name: str, value) -> bool:
         """Stage a control value (remote-origin; echoes to the GUI)."""
@@ -336,11 +367,16 @@ class CameraController(QObject):
             return False
         if not self._settings.set_if_present(name, value, clamp=True):
             return False
+        self._push_control(name)
         self.control_changed.emit(name, int(self._settings.get(name)))
         return True
 
     def readonly_values(self) -> dict:
-        """Current hardware values of read-only controls (for display)."""
+        """Current hardware values of read-only controls (for display).
+
+        Idle-only: while streaming, consume the readonly_update signal
+        instead — direct SDK reads block behind the capture thread.
+        """
         vals = {}
         if self._camera and self._control_set:
             for spec in self._control_set.readonly():
@@ -377,13 +413,21 @@ class CameraController(QObject):
     def apply_settings(self, silent=False):
         """Push ROI/format + all staged control values to the camera.
 
-        Returns a list of (name, exception) pairs; empty on full success.
-        Raises only if the camera itself rejects the ROI/format.
+        While streaming the push runs on the capture thread (the SDK
+        owner) and this returns [] immediately; errors surface via
+        status_message. Idle, it runs synchronously and returns a list
+        of (name, exception) pairs.
         """
-        cam = self._camera
-        if not cam or not self._settings:
+        if not self._camera or not self._settings:
             raise RuntimeError("no camera connected")
+        if self._streaming and self._worker:
+            self._worker.run_async(lambda: self._apply_hw(silent))
+            return []
+        return self._apply_hw(silent)
 
+    def _apply_hw(self, silent=False):
+        """The actual hardware push. Call only from the SDK-owning thread."""
+        cam = self._camera
         img_type = ImgType.RAW16 if self.img_type == "RAW16" else ImgType.RAW8
         # Only touch the ROI when it actually changed: ASISetROIFormat
         # mid-stream stalls the video pipeline for seconds (measured).
@@ -419,32 +463,55 @@ class CameraController(QObject):
             raise RuntimeError("camera has no cooler")
         if target_c is not None:
             self._cooler_target = float(target_c)
-        cam.set_cooler(on=bool(on), target_c=int(self._cooler_target))
-        if bool(on) != self._cooler_on or target_c is not None:
+        on = bool(on)
+        target = int(self._cooler_target)
+        if self._streaming and self._worker:
+            self._worker.run_async(
+                lambda: cam.set_cooler(on=on, target_c=target)
+            )
+        else:
+            cam.set_cooler(on=on, target_c=target)
+        if on != self._cooler_on or target_c is not None:
             self.tec_monitor.reset()
-        self._cooler_on = bool(on)
+        self._cooler_on = on
         self.status_message.emit(
             f"Cooler {'ON' if on else 'OFF'}, target={self._cooler_target:g} C"
         )
         self._recompute_state()
 
+    def _read_thermal_hw(self):
+        """Direct SDK thermal read. Only when the capture thread isn't
+        running (it owns the SDK while streaming)."""
+        cam = self._camera
+        if not cam or not cam.info.is_cooler:
+            return False
+        try:
+            self._last_temp = cam.temperature()
+            if cam.has_ctrl(Ctrl.COOLER_POWER_PERC):
+                self._last_power = float(
+                    cam.get_ctrl_value(Ctrl.COOLER_POWER_PERC)
+                )
+            return True
+        except ASIError:
+            return False
+
     def _poll_thermal(self):
         cam = self._camera
         if not cam or not cam.info.is_cooler:
             return
-        try:
-            temp = cam.temperature()
-            power = (
-                cam.get_ctrl_value(Ctrl.COOLER_POWER_PERC)
-                if cam.has_ctrl(Ctrl.COOLER_POWER_PERC) else 0
-            )
-        except ASIError:
+        if not self._streaming:
+            if not self._read_thermal_hw():
+                return
+        # While streaming, _last_temp/_last_power are fed by the capture
+        # thread's stats/readonly signals; just consume the cache.
+        if self._last_temp is None:
             return
         if self._cooler_on:
             self.tec_monitor.update(
-                time.monotonic(), temp, self._cooler_target, power
+                time.monotonic(), self._last_temp, self._cooler_target,
+                self._last_power,
             )
-        self.thermal_update.emit(temp, float(power))
+        self.thermal_update.emit(self._last_temp, self._last_power)
         self._recompute_state()
 
     def thermal_status(self) -> dict:
@@ -456,14 +523,11 @@ class CameraController(QObject):
         }
         cam = self._camera
         if cam and cam.info.is_cooler:
-            try:
-                d["temp"] = cam.temperature()
-                if cam.has_ctrl(Ctrl.COOLER_POWER_PERC):
-                    d["cooler_power"] = cam.get_ctrl_value(
-                        Ctrl.COOLER_POWER_PERC
-                    )
-            except ASIError:
-                pass
+            if not self._streaming:
+                self._read_thermal_hw()
+            if self._last_temp is not None:
+                d["temp"] = self._last_temp
+                d["cooler_power"] = self._last_power
         return d
 
     # =================================================================
@@ -480,12 +544,19 @@ class CameraController(QObject):
         exp_us = self._settings.get("Exposure") if self._settings else 100_000
         exp_ms = (exp_us or 100_000) / 1000.0
 
-        self._worker = CaptureWorker(cam, exp_ms)
+        readonly_ctrls = {}
+        if self._control_set:
+            readonly_ctrls = {
+                s.name: s.control_type
+                for s in self._control_set.readonly() if s.control_type >= 0
+            }
+        self._worker = CaptureWorker(cam, exp_ms, readonly_ctrls)
         self._worker_thread = QThread()
         self._worker.moveToThread(self._worker_thread)
 
         self._worker_thread.started.connect(self._worker.run)
-        self._worker.stats_update.connect(self.stats_update)
+        self._worker.stats_update.connect(self._on_worker_stats)
+        self._worker.readonly_update.connect(self._on_worker_readonly)
         self._worker.recording_progress.connect(self.record_progress)
         self._worker.recording_done.connect(self._on_recording_done)
         self._worker.error.connect(self._on_capture_error)
@@ -505,10 +576,21 @@ class CameraController(QObject):
         self._worker = None
         self._worker_thread = None
         self._streaming = False
+        self._record_pending = False
         if was_streaming:
             self.streaming_changed.emit(False)
             self.status_message.emit("Stream stopped")
         self._recompute_state()
+
+    def _on_worker_stats(self, fps, total, dropped, temp):
+        if temp == temp:  # not NaN
+            self._last_temp = float(temp)
+        self.stats_update.emit(fps, total, dropped, temp)
+
+    def _on_worker_readonly(self, ro_vals: dict):
+        if "CoolerPowerPerc" in ro_vals:
+            self._last_power = float(ro_vals["CoolerPowerPerc"])
+        self.readonly_update.emit(ro_vals)
 
     def _on_capture_error(self, msg: str):
         self._latch_error(f"Capture: {msg}")
@@ -547,23 +629,40 @@ class CameraController(QObject):
             self.set_record_params(**param_overrides)
         n = int(self.record_params["n_frames"])
 
-        # A record must always run with the currently staged settings,
-        # regardless of which surface staged them (GUI widget, remote set).
-        self.apply_settings(silent=True)
-
-        cam = self._camera
-        w, h, _bin, img_t = cam.get_roi()
-        dtype = np.uint16 if img_t == int(ImgType.RAW16) else np.uint8
-
         self._next_record_obstype = obstype or None
         self._next_record_extras = list(extra_headers or [])
 
-        self._worker.start_recording(n, w, h, dtype)
+        # Arm on the capture thread (the SDK owner): first push any staged
+        # settings, then start the recording — queue order guarantees the
+        # record runs with what the controls display, and the GUI thread
+        # never blocks on an in-flight exposure.
+        cam = self._camera
+        worker = self._worker
+        self._record_pending = True
+
+        def _arm():
+            if not self._record_pending:   # cancelled before arming
+                return
+            try:
+                self._apply_hw(silent=True)
+            except Exception:
+                log.exception("apply before record failed")
+            w, h, _bin, img_t = cam.get_roi()
+            dtype = np.uint16 if img_t == int(ImgType.RAW16) else np.uint8
+            worker.start_recording(n, w, h, dtype)
+            self._record_armed.emit(n)
+
+        worker.run_async(_arm)
+        self._recompute_state()   # pending -> EXPOSING immediately
+
+    def _on_record_armed(self, n: int):
+        self._record_pending = False
         self._recompute_state()
         self.record_started.emit(n)
         self.status_message.emit(f"Recording {n} frames...")
 
     def cancel_record(self):
+        self._record_pending = False
         if self._worker:
             self._worker.cancel_recording()
         self._next_record_obstype = None
@@ -600,18 +699,18 @@ class CameraController(QObject):
                     snap["Exposure"] / 1000.0, "[ms] exposure time"
                 )
         if cam:
-            w, h, _b, _t = cam.get_roi()
-            meta["ROI_W"] = w
-            meta["ROI_H"] = h
+            # From the cube itself -- a get_roi() SDK call here would block
+            # behind the still-streaming capture thread.
+            meta["ROI_W"] = int(cube.shape[2])
+            meta["ROI_H"] = int(cube.shape[1])
             meta["ROI_X"] = self.roi["x"]
             meta["ROI_Y"] = self.roi["y"]
-            if cam.info.is_cooler:
-                try:
-                    meta["DETTEMP"] = (
-                        cam.temperature(), "[C] sensor temperature"
-                    )
-                except ASIError:
-                    pass
+            # Cached by the capture thread -- a direct read here would
+            # block on the in-flight exposure (stream is still running).
+            if cam.info.is_cooler and self._last_temp is not None:
+                meta["DETTEMP"] = (
+                    self._last_temp, "[C] sensor temperature"
+                )
 
         # Extras from the remote client, applied last so they win.
         for extra in (self._next_record_extras or []):
