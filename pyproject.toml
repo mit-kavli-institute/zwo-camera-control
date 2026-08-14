@@ -3,9 +3,9 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "zwo-camera-gui"
-version = "0.1.0"
-description = "ZWO ASI camera streaming stress-test (PyQt5 + direct ctypes SDK)"
+name = "cmos-camera-gui"
+version = "0.2.0"
+description = "Multi-vendor CMOS camera control GUI (ZWO ASI, QHYCCD) — PyQt5 + direct ctypes SDKs, WebSocket remote control"
 requires-python = ">=3.10"
 
 dependencies = [
@@ -18,7 +18,7 @@ dependencies = [
 
 
 [project.scripts]
-zwo-camera-gui = "zwo_camera_gui.__main__:main"
+cmos-camera-gui = "cmos_camera_gui.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

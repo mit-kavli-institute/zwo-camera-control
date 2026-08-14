@@ -1,5 +1,7 @@
 """
-Entry point: python -m zwo_camera_gui [--sdk PATH] [--ws-port PORT]
+Entry point: python -m cmos_camera_gui [--sdk PATH] [--ws-port PORT]
+
+CMOS Control GUI — multi-vendor camera control.
 """
 
 import argparse
@@ -14,7 +16,7 @@ from .gui import MainWindow
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ZWO ASI streaming demo (PyQt5 + direct ctypes)"
+        description="CMOS Control GUI (PyQt5 + direct ctypes SDKs)"
     )
     parser.add_argument(
         "--sdk", metavar="PATH",

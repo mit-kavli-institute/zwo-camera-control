@@ -3,11 +3,11 @@ Synchronous Python client for the GUI's WebSocket command server.
 
 Launch the GUI with a port::
 
-    python -m zwo_camera_gui --ws-port 8765
+    python -m cmos_camera_gui --ws-port 8765
 
 Then from any other Python process::
 
-    from zwo_camera_gui.client import ASIClient
+    from cmos_camera_gui.client import ASIClient
 
     with ASIClient("ws://localhost:8765") as cam:
         cam.set(Exposure=50_000, Gain=200)

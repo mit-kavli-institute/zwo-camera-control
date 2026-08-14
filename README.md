@@ -1,25 +1,20 @@
-# ZWO Camera GUI
+# CMOS Control GUI
 
-ZWO ASI camera streaming stress-test. Direct ctypes wrapper around
-`ASICamera2.dll` — no third-party `zwoasi` dependency.
+Multi-vendor CMOS camera control: GUI + WebSocket remote command server.
+Currently supports **ZWO ASI** cameras (direct ctypes wrapper around
+`ASICamera2.dll`, no third-party `zwoasi` dependency); **QHYCCD** support
+(QHY42PRO) is in progress — see `PLAN.md` and `HANDOFF.md`.
+
+Every camera capability is driven through a headless `CameraController`, so
+the GUI and the remote WebSocket connection operate any camera identically.
 
 ## Install
 
 ```bash
-# core only (PyQt5 + numpy)
 pip install .
 
-# with FITS recording
-pip install ".[fits]"
-
-# with WebSocket remote scripting
-pip install ".[ws]"
-
-# everything
-pip install ".[all]"
-
 # editable dev install
-pip install -e ".[all]"
+pip install -e .
 ```
 
 ## SDK
@@ -32,11 +27,23 @@ place it on PATH or pass `--sdk /path/to/ASICamera2.dll`.
 
 ```bash
 # as installed console script
-zwo-camera-gui --sdk C:\path\to\ASICamera2.dll
+cmos-camera-gui --sdk C:\path\to\ASICamera2.dll
 
 # as module
-python -m zwo_camera_gui --sdk C:\path\to\ASICamera2.dll
+python -m cmos_camera_gui --sdk C:\path\to\ASICamera2.dll
 
 # with WebSocket command server --- use this one!
-zwo-camera-gui --sdk ASICamera2.dll --ws-port 8765
+cmos-camera-gui --sdk ASICamera2.dll --ws-port 8765
+```
+
+## Remote control
+
+```python
+from cmos_camera_gui.client import CameraClient
+
+with CameraClient("ws://localhost:8765") as cam:
+    cam.connect_camera(0)
+    cam.set(Exposure=50_000, Gain=200)
+    cam.wait_for_state("READY")
+    cam.capture_frames(20, directory="./captures", basename="demo")
 ```

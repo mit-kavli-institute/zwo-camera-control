@@ -267,7 +267,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, sdk_path=None, ws_port=0):
         super().__init__()
-        self.setWindowTitle("ZWO ASI Streaming Demo")
+        self.setWindowTitle("CMOS Control GUI")
         self.setMinimumSize(950, 620)
         self.resize(1200, 750)
 
