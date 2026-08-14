@@ -305,6 +305,19 @@ class CameraClient(AbstractContextManager):
         """Cancel an in-progress recording."""
         return self._send({"cmd": "abort"})
 
+    def idle_mode(self, enabled: bool,
+                  idle_exposure_us: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Toggle high-speed idle: between grabs the stream runs at a short
+        idle exposure (default 1000 us) instead of the target Exposure; a
+        record switches to the set Exposure with ~65 ms overhead, giving
+        the fastest possible first frame for long exposures.
+        """
+        cmd: Dict[str, Any] = {"cmd": "set", "idle_mode": bool(enabled)}
+        if idle_exposure_us is not None:
+            cmd["idle_exposure_us"] = int(idle_exposure_us)
+        return self._send(cmd)
+
     def clear_error(self) -> Dict[str, Any]:
         """Clear a latched ERROR state."""
         return self._send({"cmd": "clear_error"})

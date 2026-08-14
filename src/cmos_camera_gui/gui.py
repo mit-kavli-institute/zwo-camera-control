@@ -326,6 +326,7 @@ class MainWindow(QMainWindow):
         c.stats_update.connect(self._on_stats)
         c.readonly_update.connect(self._on_readonly_update)
         c.thermal_update.connect(self._on_thermal_update)
+        c.idle_changed.connect(self._sync_idle_widget)
 
         self._on_state_changed(c.camera_state.name)
 
@@ -525,6 +526,12 @@ class MainWindow(QMainWindow):
         self._cooler_readout.setText(
             f"Sensor: {temp:.1f} C   Power: {power:.0f}%"
         )
+
+    def _sync_idle_widget(self):
+        """Reflect remote-origin idle-mode changes into the checkbox."""
+        self._idle_cb.blockSignals(True)
+        self._idle_cb.setChecked(self._c.idle_mode)
+        self._idle_cb.blockSignals(False)
 
     # =====================================================================
     #  Streaming
@@ -865,6 +872,17 @@ class MainWindow(QMainWindow):
         self._stream_btn.setStyleSheet("background-color: #1a3a1a;")
         self._stream_btn.clicked.connect(self._start_stream)
         gl.addWidget(self._stream_btn)
+        self._idle_cb = QCheckBox("High-speed idle")
+        self._idle_cb.setToolTip(
+            "Between grabs, stream at a short idle exposure (1 ms) instead "
+            "of the target exposure. A grab switches to the set Exposure "
+            "with ~65 ms overhead — fastest first frame for long exposures. "
+            "Preview between grabs shows idle-length (dark) frames."
+        )
+        self._idle_cb.toggled.connect(
+            lambda on: self._c.set_idle_mode(on, notify=False)
+        )
+        gl.addWidget(self._idle_cb)
         sb.addWidget(grp)
 
         # == FITS Recording ==

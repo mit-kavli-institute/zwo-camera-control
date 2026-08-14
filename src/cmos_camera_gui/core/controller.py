@@ -54,6 +54,7 @@ class CameraController(QObject):
     stats_update = pyqtSignal(float, int, int, float)  # fps, total, dropped, temp
     readonly_update = pyqtSignal(object)         # {name: raw_value} from worker
     thermal_update = pyqtSignal(float, float)    # temp_C, power_pct
+    idle_changed = pyqtSignal()                  # remote-origin idle-mode edits
     error = pyqtSignal(str)
 
     # Internal: emitted from the capture thread once a record is armed.
@@ -91,6 +92,15 @@ class CameraController(QObject):
 
         # Display metadata contributed by the GUI (kept in FITS header)
         self.display_stretch = ""
+
+        # High-speed idle (HANDOFF §1/§4): between grabs the stream runs
+        # at idle_exposure_us; a grab switches to the staged Exposure at
+        # arm (transitions gated away) and drops back to idle when the
+        # capture completes. Restores the T + ~65 ms first-frame floor
+        # for long exposures. Off by default: preview then shows real
+        # target-exposure frames.
+        self.idle_mode = False
+        self.idle_exposure_us = 1000
 
         # Cooler state (canonical; hardware is set via set_cooler)
         self._cooler_on = False
@@ -379,6 +389,10 @@ class CameraController(QObject):
         cam, settings = self._camera, self._settings
         if not cam or not settings:
             return
+        # In high-speed idle, Exposure edits stay staged: the stream keeps
+        # idling and the grab arm applies the staged value.
+        if name == "Exposure" and self.idle_mode and self._streaming:
+            return
 
         def _do():
             try:
@@ -394,6 +408,45 @@ class CameraController(QObject):
             self._worker.run_async(_do)
         else:
             _do()
+
+    # -- high-speed idle ----------------------------------------------
+
+    def set_idle_mode(self, enabled: bool, idle_exposure_us=None,
+                      notify=True):
+        """Toggle high-speed idle; optionally set the idle exposure [us]."""
+        self.idle_mode = bool(enabled)
+        if idle_exposure_us is not None:
+            self.idle_exposure_us = max(1, int(idle_exposure_us))
+        if self._streaming and not self._recording_active():
+            if self.idle_mode:
+                self._push_idle_exposure()
+            else:
+                self._push_control("Exposure")   # restore staged exposure
+        self.status_message.emit(
+            f"High-speed idle {'ON' if self.idle_mode else 'OFF'}"
+            + (f" ({self.idle_exposure_us} us)" if self.idle_mode else "")
+        )
+        if notify:
+            self.idle_changed.emit()
+
+    def _push_idle_exposure(self):
+        """Drop the running stream to the idle exposure (worker thread)."""
+        if not (self.idle_mode and self._streaming and self._worker):
+            return
+        spec = self._control_set.get("Exposure") if self._control_set else None
+        if spec is None:
+            return
+        cam = self._camera
+        us = int(self.idle_exposure_us)
+
+        def _do():
+            try:
+                cam.set_ctrl(spec.control_type, us)
+                self._applied_exposure_s = us / 1e6
+            except Exception as e:
+                log.debug("idle exposure push failed: %s", e)
+
+        self._worker.run_async(_do)
 
     def set_control(self, name: str, value) -> bool:
         """Stage a control value (remote-origin; echoes to the GUI)."""
@@ -476,6 +529,19 @@ class CameraController(QObject):
         exp = self._settings.get("Exposure")
         if exp:
             self._applied_exposure_s = exp / 1e6
+
+        # In high-speed idle, a full apply outside a grab must drop the
+        # stream back to the idle exposure (this runs on the SDK thread).
+        if (self.idle_mode and self._streaming
+                and not self._recording_active()):
+            spec = self._settings.control_set.get("Exposure")
+            if spec is not None:
+                try:
+                    cam.set_ctrl(spec.control_type,
+                                 int(self.idle_exposure_us))
+                    self._applied_exposure_s = self.idle_exposure_us / 1e6
+                except Exception as e:
+                    log.debug("idle exposure re-push failed: %s", e)
 
         if not silent:
             if errors:
@@ -602,6 +668,8 @@ class CameraController(QObject):
 
         self._worker_thread.start()
         self._streaming = True
+        if self.idle_mode:
+            self._push_idle_exposure()
         self.streaming_changed.emit(True)
         self.status_message.emit("Streaming...")
 
@@ -728,6 +796,7 @@ class CameraController(QObject):
         self._record_pending = False
         if self._worker:
             self._worker.cancel_recording()
+        self._push_idle_exposure()
         self._next_record_obstype = None
         self._next_record_extras = []
         self._recompute_state()
@@ -793,6 +862,9 @@ class CameraController(QObject):
         return meta
 
     def _on_recording_done(self, cube, timestamps, elapsed):
+        # Capture complete: drop straight back to the idle exposure so
+        # the camera is re-armed while the FITS save runs.
+        self._push_idle_exposure()
         meta = self._build_record_metadata(cube, elapsed)
         # Per-frame vendor metadata (e.g. QHY GPS seq/UTC), if the worker
         # collected any during this record.
@@ -863,6 +935,8 @@ class CameraController(QObject):
             result.update(self.thermal_status())
             result["roi"] = dict(self.roi)
             result["img_type"] = self.img_type
+            result["idle_mode"] = self.idle_mode
+            result["idle_exposure_us"] = self.idle_exposure_us
         if self._settings:
             result["controls"] = self._settings.snapshot()
         return result
@@ -913,6 +987,11 @@ class CameraController(QObject):
                     roi_kwargs["img_type"] = str(value)
                 elif key in ("roi_w", "roi_h", "roi_x", "roi_y"):
                     roi_kwargs[key[4:]] = int(value)
+                elif key == "idle_mode":
+                    self.set_idle_mode(bool(value))
+                elif key == "idle_exposure_us":
+                    self.set_idle_mode(self.idle_mode,
+                                       idle_exposure_us=value)
                 else:
                     self.set_control(key, value)
             if roi_kwargs:
