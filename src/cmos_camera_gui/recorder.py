@@ -126,8 +126,18 @@ def _frame_meta_hdu(n, timestamps=None, frame_meta=None):
     return hdu
 
 
+def _atomic_writeto(hdu_or_list, path):
+    """Write FITS to a temp file then atomically rename into place, so a
+    failed save never leaves a partial file at the target path (WSP reads
+    the file the instant is_capturing drops false)."""
+    tmp = path + ".part"
+    hdu_or_list.writeto(tmp, overwrite=True, output_verify="silentfix")
+    os.replace(tmp, path)
+
+
 def save_fits_cube(path, cube, metadata, on_done, combine="none",
-                   combine_only=False, timestamps=None, frame_meta=None):
+                   combine_only=False, timestamps=None, frame_meta=None,
+                   wsp_single=False):
     """
     Write a FITS cube to disk in a background thread.
 
@@ -156,6 +166,11 @@ def save_fits_cube(path, cube, metadata, on_done, combine="none",
     frame_meta : list[dict], optional
         Per-frame vendor metadata (e.g. QHY GPS seq/UTC); stored as
         FRAMEMETA columns alongside the host timing.
+    wsp_single : bool
+        WSP contract output (SummerCameraGuiHandoff R3): for a 1-frame
+        cube, write a single 2D image HDU (frame metadata as header
+        cards, no FRAMEMETA extension); multi-frame cubes keep the 3D
+        primary. Writes are atomic (temp + rename) either way.
     """
     if not HAS_ASTROPY:
         on_done("FITS save error: astropy not installed")
@@ -182,14 +197,24 @@ def save_fits_cube(path, cube, metadata, on_done, combine="none",
                 hdr["COMMENT"] = (
                     f"Recorded {cube.shape[0]} frames in {elapsed:.3f}s"
                 )
-                primary = pyfits.PrimaryHDU(data=cube, header=hdr)
-                hdus = [primary]
-                meta_hdu = _frame_meta_hdu(cube.shape[0], timestamps,
-                                           frame_meta)
-                if meta_hdu is not None:
-                    hdus.append(meta_hdu)
-                pyfits.HDUList(hdus).writeto(path, overwrite=True,
-                                             output_verify='silentfix')
+                if wsp_single and cube.shape[0] == 1:
+                    # WSP R3: single 2D image HDU at the exact path.
+                    if frame_meta and frame_meta[0]:
+                        for k, v in frame_meta[0].items():
+                            hdr[k] = v
+                    if timestamps:
+                        hdr["TIMESTMP"] = (float(timestamps[0]),
+                                           "[s] since recording start")
+                    primary = pyfits.PrimaryHDU(data=cube[0], header=hdr)
+                    _atomic_writeto(primary, path)
+                else:
+                    primary = pyfits.PrimaryHDU(data=cube, header=hdr)
+                    hdus = [primary]
+                    meta_hdu = _frame_meta_hdu(cube.shape[0], timestamps,
+                                               frame_meta)
+                    if meta_hdu is not None:
+                        hdus.append(meta_hdu)
+                    _atomic_writeto(pyfits.HDUList(hdus), path)
                 mb = cube.nbytes / 1e6
                 parts.append(
                     f"{cube.shape[0]} frames -> {path}  "

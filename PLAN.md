@@ -365,18 +365,19 @@ TEC runs unattended with keep-alive; `tec_locked` = threshold+dwell stability.
   required-header item; GPS-locked time when available, host UTC otherwise,
   with TIMESRC recording which.
 
-**Flagged / unclear (need user or ops decision):**
-- **U1:** `nframes > 1` naming for WSP is explicitly out of scope (daemon
-  always sends 1); local multi-frame keeps cube/indiv behavior.
-- **U2:** TEC warm-up ramp at shutdown — spring waits for >-45 °C; QHY off is
-  instant (MANULPWM=0). Does the GSENSE400BSI need a ramped warm-up? No
-  guidance in HANDOFF; check with QHY docs / sensor datasheet.
-- **U3:** TEC_SETTLING remains visible in camera_state (same as pirt): a
-  set_exposure issued while the TEC is re-settling mid-night stalls its
-  completion check until READY returns — identical to spring's behavior, but
-  worth knowing operationally.
-- **U4:** confirm SUMMER == this QHY42 system (naming assumption), and which
-  machine runs the GUI as an autostart service.
+**Flag resolutions (2026-08-14, Nate):**
+- **U1 → resolved:** WSP `capture` must support `nframes > 1` as a *reserved
+  option*: one file at the exact `<save_path>/<filename>.fits` path —
+  `nframes=1` writes a single 2D image HDU; `nframes>1` writes the (N,H,W)
+  cube (+ FRAMEMETA) in that single file. Caveat (WSP-side): whatever reads
+  `last_image.fits` must tolerate a 3D cube when the stack option is used.
+- **U2 → resolved:** instant TEC shutdown is fine; no warm-up ramp.
+- **U3 → accepted, watch:** TEC_SETTLING can stall a mid-night set_exposure
+  completion (same as pirt/spring). Left as-is; revisit if it bites in ops.
+- **U4 → resolved:** SUMMER == the QHY42 *on the telescope only*; the GUI is
+  also a general lab tool for QHY + ZWO cameras. Instrument name must be
+  deployment config (INSTRUME/camname = "summer" at the telescope, camera
+  model by default in the lab).
 
 ## 11. Decisions taken (flag if you disagree)
 

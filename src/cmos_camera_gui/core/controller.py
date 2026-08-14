@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-
+from datetime import datetime
 
 from PyQt5.QtCore import QObject, QThread, QTimer, pyqtSignal
 
@@ -59,6 +59,9 @@ class CameraController(QObject):
 
     # Internal: emitted from the capture thread once a record is armed.
     _record_armed = pyqtSignal(int)
+    # Internal: emitted from the capture thread when a queued exposure
+    # push has reached the hardware (clears SETTING_EXPOSURE).
+    _exposure_applied = pyqtSignal()
 
     def __init__(self, sdk_path=None, parent=None):
         super().__init__(parent)
@@ -71,6 +74,17 @@ class CameraController(QObject):
         self._worker_thread = None
         self._streaming = False
         self._applied_exposure_s = None    # exposure last pushed to hardware
+
+        # WSP contract state (SummerCameraGuiHandoff §2): the requested
+        # exposure in float seconds, echoed EXACTLY in get_status (the
+        # daemon's completion check is a float == test); and a flag for
+        # the SETTING_EXPOSURE window while a push is queued to hardware.
+        self._requested_exposure_s = None
+        self._exposure_settling = False
+        # Deployment identity: overrides INSTRUME / status camname
+        # ("summer" at the telescope; camera model by default in the lab).
+        self.instrument_name = None
+        self._record_start_utc = None      # wall-clock UTC at record arm
 
         self._control_set = None    # CameraControlSet
         self._settings = None       # CameraSettings
@@ -110,6 +124,7 @@ class CameraController(QObject):
         # Per-record header extras (from remote record cmd; cleared after)
         self._next_record_obstype = None
         self._next_record_extras = []
+        self._next_record_wsp = False   # WSP single-file output semantics
 
         # One-shot callback for the remote server's record-done follow-up.
         # May be invoked from the FITS writer thread's bridge (GUI thread).
@@ -126,6 +141,7 @@ class CameraController(QObject):
         self._last_power = 0.0
 
         self._record_armed.connect(self._on_record_armed)
+        self._exposure_applied.connect(self._on_exposure_applied)
 
         # Thermal poll (runs while connected on cooled cameras)
         self._thermal_timer = QTimer(self)
@@ -153,6 +169,8 @@ class CameraController(QObject):
             new = CameraState.EXPOSING
         elif self._saving:
             new = CameraState.SAVING
+        elif self._exposure_settling:
+            new = CameraState.SETTING_EXPOSURE
         elif self._cooler_on and not self.tec_monitor.settled:
             new = CameraState.TEC_SETTLING
         else:
@@ -389,6 +407,10 @@ class CameraController(QObject):
         cam, settings = self._camera, self._settings
         if not cam or not settings:
             return
+        if name == "Exposure":
+            val = settings.get("Exposure")
+            if val:
+                self._requested_exposure_s = val / 1e6
         # In high-speed idle, Exposure edits stay staged: the stream keeps
         # idling and the grab arm applies the staged value.
         if name == "Exposure" and self.idle_mode and self._streaming:
@@ -403,11 +425,22 @@ class CameraController(QObject):
                         self._applied_exposure_s = val / 1e6
             except Exception as e:
                 log.debug("live-apply %s failed: %s", name, e)
+            finally:
+                if name == "Exposure":
+                    self._exposure_applied.emit()
 
         if self._streaming and self._worker:
+            if name == "Exposure":
+                self._exposure_settling = True
+                self._recompute_state()
             self._worker.run_async(_do)
         else:
             _do()
+            self._exposure_settling = False
+
+    def _on_exposure_applied(self):
+        self._exposure_settling = False
+        self._recompute_state()
 
     # -- high-speed idle ----------------------------------------------
 
@@ -620,19 +653,21 @@ class CameraController(QObject):
         self._recompute_state()
 
     def thermal_status(self) -> dict:
+        """Thermal snapshot, served purely from the telemetry cache.
+
+        Never touches the SDK (WSP polls status at 1 Hz and must never
+        block on hardware); the 2 s thermal timer and the capture thread
+        keep the cache fresh.
+        """
         d = {
             "cooler_on": self._cooler_on,
             "setpoint": self._cooler_target,
             "tec_locked": bool(self._cooler_on and self.tec_monitor.settled),
             "tec_stalled": bool(self.tec_monitor.stalled),
         }
-        cam = self._camera
-        if cam and cam.info.is_cooler:
-            if not self._streaming:
-                self._read_thermal_hw()
-            if self._last_temp is not None:
-                d["temp"] = self._last_temp
-                d["cooler_power"] = self._last_power
+        if self._last_temp is not None:
+            d["temp"] = self._last_temp
+            d["cooler_power"] = self._last_power
         return d
 
     # =================================================================
@@ -788,12 +823,14 @@ class CameraController(QObject):
 
     def _on_record_armed(self, n: int):
         self._record_pending = False
+        self._record_start_utc = datetime.utcnow()
         self._recompute_state()
         self.record_started.emit(n)
         self.status_message.emit(f"Recording {n} frames...")
 
     def cancel_record(self):
         self._record_pending = False
+        self._next_record_wsp = False
         if self._worker:
             self._worker.cancel_recording()
         self._push_idle_exposure()
@@ -808,12 +845,31 @@ class CameraController(QObject):
         actual_fps = cube.shape[0] / elapsed if elapsed > 0 else 0
 
         meta = {
-            "INSTRUME": cam.info.name if cam else "unknown",
+            "INSTRUME": self.instrument_name or (
+                cam.info.name if cam else "unknown"
+            ),
+            "DETECTOR": (cam.info.name if cam else "unknown",
+                         "camera model"),
             "NFRAMES": cube.shape[0],
             "STRMFPS": (round(actual_fps, 3), "measured stream rate [fps]"),
             "ELAPSED": (round(elapsed, 4), "total acquisition time [s]"),
             "DEPTH": self.img_type,
         }
+
+        # DATE-OBS: GPS time of first kept frame when locked, else host
+        # UTC of the record arm; TIMESRC records which.
+        frame_meta = getattr(self._worker, "last_frame_meta", None) or []
+        gps0 = frame_meta[0] if frame_meta and frame_meta[0] else {}
+        if gps0.get("GPS_LOCK") and gps0.get("DATE-BEG"):
+            meta["DATE-OBS"] = (gps0["DATE-BEG"],
+                                "UTC of first frame exposure start (GPS)")
+            meta["TIMESRC"] = ("gps", "time source for DATE-OBS")
+        elif self._record_start_utc is not None:
+            meta["DATE-OBS"] = (
+                self._record_start_utc.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
+                "UTC at record arm (host clock)",
+            )
+            meta["TIMESRC"] = ("host", "time source for DATE-OBS")
         if self.display_stretch:
             meta["STRETCH"] = self.display_stretch
         if self._next_record_obstype:
@@ -877,12 +933,18 @@ class CameraController(QObject):
         stack_mode = self.record_params["mode"] == "stack"
         combine = self.record_params["combine"]
         combine_only = bool(self.record_params["combine_only"])
+        wsp_single = self._next_record_wsp
+        self._next_record_wsp = False
 
         self._saving = True
         self._recompute_state()
 
         def _after_save(msg):
             self._saving = False
+            if msg.startswith("FITS save error"):
+                # WSP contract: a failed capture must not look complete --
+                # is_capturing drops false AND the camera leaves READY.
+                self._latch_error(msg)
             self.status_message.emit(msg)
             self.record_finished.emit(msg)
             if self._record_done_cb:
@@ -900,13 +962,139 @@ class CameraController(QObject):
             path = os.path.join(directory, f"{basename}.fits")
             save_fits_cube(path, cube, meta, _after_save,
                            combine=combine, combine_only=combine_only,
-                           timestamps=timestamps, frame_meta=frame_meta)
+                           timestamps=timestamps, frame_meta=frame_meta,
+                           wsp_single=wsp_single)
         else:
             save_fits_individual(
                 directory, basename, cube, timestamps, meta, _after_save,
                 combine=combine, combine_only=combine_only,
                 frame_meta=frame_meta,
             )
+
+    # =================================================================
+    #  WSP / SUMMER contract surface (SummerCameraGuiHandoff §2)
+    # =================================================================
+
+    def set_exposure_seconds(self, seconds):
+        """WSP set_exposure: float SECONDS, stored for exact echo."""
+        seconds = float(seconds)
+        us = max(1, int(round(seconds * 1e6)))
+        if not self.set_control("Exposure", us):
+            raise RuntimeError("no camera connected (Exposure unavailable)")
+        # Echo the requested float exactly (daemon does a float == check),
+        # overriding the µs round-trip value set_control stored.
+        self._requested_exposure_s = seconds
+
+    def set_save_path(self, directory):
+        d = os.path.expanduser(str(directory))
+        os.makedirs(d, exist_ok=True)
+        self.set_record_params(directory=d)
+        return d
+
+    def set_tec_temperature(self, target_c):
+        self._cooler_target = float(target_c)
+        self.tec_monitor.reset()
+        if self._cooler_on:
+            self.set_cooler(True, target_c)
+        self._recompute_state()
+
+    def wsp_capture(self, filename, nframes=1, object_name=None,
+                    observer=None, headers=None):
+        """WSP capture: non-blocking; writes exactly
+        <save_path>/<filename>.fits (2D for nframes=1, cube for >1).
+
+        is_capturing is true in status synchronously with this call
+        returning (R1); completion is detected by polling.
+        """
+        if not self.connected:
+            raise RuntimeError("no camera connected")
+        if not self._streaming:
+            self.start_stream()
+
+        extras = []
+        if object_name is not None:
+            extras.append(["OBJECT", object_name, "target name"])
+        extras.append(["OBSERVER", observer or "unknown", None])
+        for h in (headers or []):
+            if isinstance(h, dict):
+                extras.extend([k, v, None] for k, v in h.items())
+            else:
+                extras.append(list(h))
+
+        self._next_record_wsp = True
+        self.start_record(
+            extra_headers=extras,
+            n_frames=int(nframes),
+            basename=str(filename),
+            mode="stack",
+            combine="none",
+            combine_only=False,
+        )
+
+    def wsp_status(self) -> dict:
+        """The §2.2 get_status data snapshot. Cache-only, JSON-native."""
+        cam = self._camera
+        is_capturing = bool(self._recording_active() or self._saving)
+
+        cur, tot = 0, 0
+        if self._worker is not None:
+            with self._worker._rec_lock:
+                if self._worker._rec_cube is not None:
+                    cur = int(self._worker._rec_idx)
+                    tot = int(self._worker._rec_target)
+        if tot == 0 and is_capturing:
+            tot = int(self.record_params["n_frames"])
+
+        exp_s = self._requested_exposure_s
+        if exp_s is None and self._settings:
+            v = self._settings.get("Exposure")
+            exp_s = (v / 1e6) if v else 0.0
+        exp_s = float(exp_s or 0.0)
+
+        cadence = exp_s + (
+            self._vendor.profile.cadence_overhead_s if self._vendor else 0.3
+        )
+        remaining = max(0.0, (tot - cur) * cadence) if is_capturing else 0.0
+
+        data = {
+            "camera_state": self._state.name,
+            "ready": bool(cam is not None
+                          and self._state is CameraState.READY),
+            "is_capturing": is_capturing,
+            "current_frame": cur,
+            "total_frames": tot,
+            "capture_time_remaining": float(remaining),
+            "exposure": exp_s,
+            "tec_temp": float(self._last_temp)
+            if self._last_temp is not None else -888,
+            "tec_setpoint": float(self._cooler_target),
+            "tec_enabled": int(self._cooler_on),
+            "tec_locked": int(self._cooler_on and self.tec_monitor.settled),
+            "tec_voltage": -888,                    # QHY exposes PWM only
+            "tec_power_pct": float(self._last_power),
+            "save_path": str(self.record_params["directory"]),
+            "case_temp": -888,
+            "digpcb_temp": -888,
+            "senspcb_temp": -888,
+            # extras (forwarded into WSP telemetry by the daemon)
+            "camname": self.instrument_name or (
+                cam.info.name if cam else None
+            ),
+            "vendor": self._vendor.name if self._vendor else None,
+            "connected": cam is not None,
+            "streaming": bool(self._streaming),
+            "nframes": int(self.record_params["n_frames"]),
+            "idle_mode": bool(self.idle_mode),
+        }
+        if self._settings:
+            for k, v in self._settings.snapshot().items():
+                if k != "Exposure":
+                    data[k.lower()] = v
+        gps = getattr(self._worker, "last_gps", None) if self._worker else None
+        if gps:
+            data["gps_locked"] = int(bool(gps.get("GPS_LOCK")))
+            data["gps_seq"] = gps.get("GPS_SEQ")
+        return {"status": "success", "data": data}
 
     # =================================================================
     #  Status / remote command dispatch
@@ -1076,6 +1264,60 @@ class CameraController(QObject):
             self.clear_error()
             return {"cmd": "clear_error", "ok": True,
                     "camera_state": self._state.name}
+
+        # ---- WSP / SUMMER contract verbs (SummerCameraGuiHandoff §2) ----
+        # Reply convention: {"status": "success"|"error", "message": ...}
+
+        elif action == "get_status":
+            try:
+                return self.wsp_status()
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+
+        elif action == "set_exposure":
+            try:
+                self.set_exposure_seconds(cmd["exposure"])
+                return {"status": "success",
+                        "message": f"exposure set to {cmd['exposure']}s"}
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+
+        elif action == "set_save_path":
+            try:
+                d = self.set_save_path(cmd["path"])
+                return {"status": "success", "message": f"save path {d}"}
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+
+        elif action == "capture":
+            try:
+                self.wsp_capture(
+                    filename=cmd["filename"],
+                    nframes=int(cmd.get("nframes", 1)),
+                    object_name=cmd.get("object"),
+                    observer=cmd.get("observer"),
+                    headers=cmd.get("headers"),
+                )
+                return {"status": "success", "message": "capture started"}
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+
+        elif action == "set_tec_enabled":
+            try:
+                self.set_cooler(on=bool(cmd.get("enabled", False)),
+                                target_c=self._cooler_target)
+                return {"status": "success",
+                        "message": f"TEC enabled={bool(cmd.get('enabled'))}"}
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+
+        elif action == "set_tec_temperature":
+            try:
+                self.set_tec_temperature(float(cmd["temperature"]))
+                return {"status": "success",
+                        "message": f"TEC setpoint {cmd['temperature']}C"}
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
 
         return {"error": f"unknown command: {action}"}
 
