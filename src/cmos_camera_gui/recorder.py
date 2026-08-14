@@ -77,8 +77,57 @@ def _combined_path(path, method):
     return f"{base}_{method}{ext or '.fits'}"
 
 
+def _frame_meta_hdu(n, timestamps=None, frame_meta=None):
+    """Build a FRAMEMETA bintable of per-frame values for a cube save.
+
+    Columns: FRAME_ID, TIMESTMP, DELTA_T (host timing) plus one column per
+    key found in frame_meta dicts (e.g. GPS_SEQ, GPS_LOCK, DATE-BEG from
+    the QHY GPS row). Returns None if there is nothing to record.
+    """
+    if timestamps is None and not frame_meta:
+        return None
+
+    cols = [pyfits.Column(name="FRAME_ID", format="K",
+                          array=np.arange(n, dtype=np.int64))]
+    if timestamps is not None:
+        ts = np.asarray(timestamps, dtype=np.float64)
+        cols.append(pyfits.Column(name="TIMESTMP", format="D", unit="s",
+                                  array=ts))
+        cols.append(pyfits.Column(name="DELTA_T", format="D", unit="s",
+                                  array=np.diff(ts, prepend=0.0)))
+
+    if frame_meta:
+        keys = []
+        for m in frame_meta:
+            for k in (m or {}):
+                if k not in keys:
+                    keys.append(k)
+        for k in keys:
+            vals = [(m or {}).get(k) for m in frame_meta]
+            sample = next((v for v in vals if v is not None), None)
+            if isinstance(sample, bool):
+                arr = np.array([bool(v) for v in vals])
+                cols.append(pyfits.Column(name=k, format="L", array=arr))
+            elif isinstance(sample, int):
+                arr = np.array([int(v or 0) for v in vals], dtype=np.int64)
+                cols.append(pyfits.Column(name=k, format="K", array=arr))
+            elif isinstance(sample, float):
+                arr = np.array([float(v or 0) for v in vals])
+                cols.append(pyfits.Column(name=k, format="D", array=arr))
+            else:
+                strs = ["" if v is None else str(v) for v in vals]
+                width = max(1, max(len(s) for s in strs))
+                cols.append(pyfits.Column(name=k, format=f"{width}A",
+                                          array=np.array(strs)))
+
+    hdu = pyfits.BinTableHDU.from_columns(cols)
+    hdu.header["EXTNAME"] = "FRAMEMETA"
+    hdu.header["COMMENT"] = "per-frame metadata (host timing + vendor, e.g. GPS)"
+    return hdu
+
+
 def save_fits_cube(path, cube, metadata, on_done, combine="none",
-                   combine_only=False):
+                   combine_only=False, timestamps=None, frame_meta=None):
     """
     Write a FITS cube to disk in a background thread.
 
@@ -101,6 +150,12 @@ def save_fits_cube(path, cube, metadata, on_done, combine="none",
     combine_only : bool
         With combine != "none": skip the cube, save only the combined
         frame.
+    timestamps : list[float], optional
+        Per-frame host timestamps [s since record start]; stored in a
+        FRAMEMETA bintable extension of the cube file.
+    frame_meta : list[dict], optional
+        Per-frame vendor metadata (e.g. QHY GPS seq/UTC); stored as
+        FRAMEMETA columns alongside the host timing.
     """
     if not HAS_ASTROPY:
         on_done("FITS save error: astropy not installed")
@@ -128,8 +183,13 @@ def save_fits_cube(path, cube, metadata, on_done, combine="none",
                     f"Recorded {cube.shape[0]} frames in {elapsed:.3f}s"
                 )
                 primary = pyfits.PrimaryHDU(data=cube, header=hdr)
-                primary.writeto(path, overwrite=True,
-                                output_verify='silentfix')
+                hdus = [primary]
+                meta_hdu = _frame_meta_hdu(cube.shape[0], timestamps,
+                                           frame_meta)
+                if meta_hdu is not None:
+                    hdus.append(meta_hdu)
+                pyfits.HDUList(hdus).writeto(path, overwrite=True,
+                                             output_verify='silentfix')
                 mb = cube.nbytes / 1e6
                 parts.append(
                     f"{cube.shape[0]} frames -> {path}  "
@@ -154,12 +214,15 @@ def save_fits_cube(path, cube, metadata, on_done, combine="none",
 
 
 def save_fits_individual(directory, basename, cube, timestamps, metadata,
-                         on_done, combine="none", combine_only=False):
+                         on_done, combine="none", combine_only=False,
+                         frame_meta=None):
     """
     Write one FITS file per frame: {directory}/{basename}_NNNN.fits.
 
     Each file gets the full `metadata` dict in its header plus per-frame
-    FRAME_IDX, TIMESTAMP (s since start), and DELTA_T (s since previous frame).
+    FRAME_IDX, TIMESTAMP (s since start), and DELTA_T (s since previous
+    frame), plus any per-frame vendor metadata (frame_meta[i] dict, e.g.
+    QHY GPS seq/UTC) as header cards.
 
     combine/combine_only: as in save_fits_cube — additionally (or only)
     save {basename}_{combine}.fits.
@@ -189,6 +252,9 @@ def save_fits_individual(directory, basename, cube, timestamps, metadata,
                 hdr["FRAME_ID"] = (int(i), "frame index within the series")
                 hdr["TIMESTMP"] = (float(ts_arr[i]), "[s] since recording start")
                 hdr["DELTA_T"] = (float(dt_arr[i]), "[s] since previous frame")
+                if frame_meta and i < len(frame_meta) and frame_meta[i]:
+                    for k, v in frame_meta[i].items():
+                        hdr[k] = v
                 # FITS headers must be printable ASCII -- no unicode dashes
                 hdr["COMMENT"] = "CMOS Control GUI individual frame"
 

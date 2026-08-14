@@ -273,6 +273,18 @@ only `backend.thermal()` samples):
 
 ## 8. Phased execution (each phase leaves a working app)
 
+**Status (2026-08-14):** Phases 0-1 done and hardware-validated (ASI294).
+Phase 2 landed in a pragmatic form: instead of a formal Qt-free
+`CameraBackend` ABC, vendors are duck-typed adapters + per-vendor capture
+workers under `vendors/{zwo,qhy}/` with a registry, the SDK-thread-owns-
+everything contract, the shared `RecordGate`, per-vendor profiles
+(defaults, TEC tuning), capability flags driving the GUI, vendor run
+header cards (`DATASEC`, `GPSROW0`, ...), and per-frame metadata
+(FRAMEMETA bintable / GPS cards) — i.e. Phase 3's header essentials came
+along. The formal ABC + full required-header validation remain future
+polish. Phase 4 (QHY) is code-complete per HANDOFF; hardware validation
+pending (drop `qhyccd.dll` into `sdk/`).
+
 | Phase | Work | Risk / validation |
 |---|---|---|
 | **0. Rename** | `git mv` package, update pyproject/entry point/README; window title "CMOS Control GUI" | Mechanical; app runs as before |

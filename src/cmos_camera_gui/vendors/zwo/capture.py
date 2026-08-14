@@ -10,6 +10,7 @@ import ctypes
 import queue
 import threading
 import time
+from collections import deque
 
 import numpy as np
 
@@ -74,9 +75,18 @@ class CaptureWorker(QObject):
         self._rec_lock = threading.Lock()
         self._rec_cube = None
         self._rec_timestamps = None
+        self._rec_gate = None
         self._rec_target = 0
         self._rec_idx = 0
         self._rec_t0 = 0.0
+
+        # Per-frame metadata of the last record (None for ZWO: no
+        # hardware timestamps; host timestamps are delivered separately).
+        self.last_frame_meta = None
+
+        # Recent inter-arrival deltas (feeds the record-gate cadence
+        # estimate in the controller).
+        self._deltas = deque(maxlen=8)
 
     def request_stop(self):
         self._stop.set()
@@ -100,11 +110,23 @@ class CaptureWorker(QObject):
             except Exception as exc:
                 self.error.emit(f"deferred SDK call failed: {exc}")
 
-    def start_recording(self, n_frames, width, height, dtype):
-        """Begin recording into a pre-allocated cube. Thread-safe."""
+    def recent_median_delta(self):
+        """Median of recent frame inter-arrival times, or None."""
+        if not self._deltas:
+            return None
+        vals = sorted(self._deltas)
+        return vals[len(vals) // 2]
+
+    def start_recording(self, n_frames, width, height, dtype, gate=None):
+        """Begin recording into a pre-allocated cube. Thread-safe.
+
+        gate: optional core.gating.RecordGate -- frames it rejects
+        (in-flight / transition frames) are not stored.
+        """
         with self._rec_lock:
             self._rec_cube = np.empty((n_frames, height, width), dtype=dtype)
             self._rec_timestamps = np.empty(n_frames, dtype=np.float64)
+            self._rec_gate = gate
             self._rec_target = n_frames
             self._rec_idx = 0
             self._rec_t0 = time.perf_counter()
@@ -114,6 +136,7 @@ class CaptureWorker(QObject):
         with self._rec_lock:
             self._rec_cube = None
             self._rec_timestamps = None
+            self._rec_gate = None
             self._rec_idx = 0
 
     @pyqtSlot()
@@ -140,6 +163,7 @@ class CaptureWorker(QObject):
         fps_t0 = time.perf_counter()
         total = 0
         fps = 0.0
+        prev_arrival = None
 
         cam.start_video()
         try:
@@ -161,6 +185,10 @@ class CaptureWorker(QObject):
                     c_buf, dtype=dtype
                 ).reshape((h, w)).copy()
                 now = time.perf_counter()
+                delta = (now - prev_arrival) if prev_arrival else 0.0
+                prev_arrival = now
+                if delta > 0:
+                    self._deltas.append(delta)
                 total += 1
                 fps_count += 1
                 dt = now - fps_t0
@@ -172,7 +200,10 @@ class CaptureWorker(QObject):
                 # -- Recording (pre-allocated cube) --
                 rec_finished = None
                 with self._rec_lock:
-                    if self._rec_cube is not None:
+                    if self._rec_cube is not None and (
+                        self._rec_gate is None
+                        or self._rec_gate.accept(now, delta)
+                    ):
                         idx = self._rec_idx
                         if idx < self._rec_target:
                             self._rec_cube[idx] = frame

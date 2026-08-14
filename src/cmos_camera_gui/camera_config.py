@@ -154,9 +154,14 @@ class ControlSpec:
         return True, ""
 
     @classmethod
-    def from_caps_dict(cls, name: str, caps: dict) -> "ControlSpec":
+    def from_caps_dict(cls, name: str, caps: dict,
+                       default_override=None) -> "ControlSpec":
         """Build from a caps dict with keys: MinValue, MaxValue,
-        DefaultValue, IsAutoSupported, IsWritable, ControlType, Description."""
+        DefaultValue, IsAutoSupported, IsWritable, ControlType, Description.
+
+        default_override: explicit default from a vendor profile; when
+        None, the legacy module-level _DEFAULT_OVERRIDES applies.
+        """
         is_writable = bool(caps.get("IsWritable", True)) and name not in _FORCE_READONLY
 
         kind = _KIND_BY_NAME.get(name)
@@ -173,7 +178,7 @@ class ControlSpec:
         min_value = int(caps.get("MinValue", 0))
         max_value = int(caps.get("MaxValue", 0))
         sdk_default = int(caps.get("DefaultValue", 0))
-        override = _DEFAULT_OVERRIDES.get(name)
+        override = default_override
         default_value = (
             max(min_value, min(max_value, override)) if override is not None
             else sdk_default
@@ -257,13 +262,21 @@ class CameraControlSet:
         return "CoolerOn" in self.specs
 
     @classmethod
-    def from_caps_dict(cls, camera_name: str, raw_caps: dict) -> "CameraControlSet":
+    def from_caps_dict(cls, camera_name: str, raw_caps: dict,
+                       default_overrides=None) -> "CameraControlSet":
+        """default_overrides: {name: value} from the vendor profile.
+        When None, the legacy module-level _DEFAULT_OVERRIDES applies
+        (a vendor with no overrides should pass {})."""
+        ov_source = (_DEFAULT_OVERRIDES if default_overrides is None
+                     else default_overrides)
         specs = {}
         for sdk_name, caps in raw_caps.items():
             if sdk_name in _HIDDEN:
                 continue
             name = _NAME_RENAMES.get(sdk_name, sdk_name)
-            specs[name] = ControlSpec.from_caps_dict(name, caps)
+            specs[name] = ControlSpec.from_caps_dict(
+                name, caps, default_override=ov_source.get(name)
+            )
         return cls(camera_name=camera_name, specs=specs)
 
     def describe(self) -> str:

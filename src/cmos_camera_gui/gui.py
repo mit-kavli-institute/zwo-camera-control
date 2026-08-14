@@ -381,9 +381,18 @@ class MainWindow(QMainWindow):
             self._sync_roi_ranges()
             self._sync_roi_widgets()
 
+            caps = self._c.capabilities()
+
+            # Image formats the camera supports (QHY backend is 16-bit only)
+            img_types = caps.get("img_types", ["RAW8", "RAW16"])
+            self._raw8_rb.setEnabled("RAW8" in img_types)
+            self._raw16_rb.setEnabled("RAW16" in img_types)
+            if "RAW8" not in img_types:
+                self._raw16_rb.setChecked(True)
+
             cs = self._c.control_set
-            self._cooler_group.setVisible(cs.has_cooler())
-            if cs.has_cooler():
+            self._cooler_group.setVisible(caps.get("has_cooler", False))
+            if caps.get("has_cooler"):
                 spec = cs.get("TargetTemp")
                 if spec:
                     self._cooler_temp.setRange(spec.min_value, spec.max_value)

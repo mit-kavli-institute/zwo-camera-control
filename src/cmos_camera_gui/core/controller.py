@@ -24,28 +24,17 @@ import logging
 import os
 import time
 
-import numpy as np
 
 from PyQt5.QtCore import QObject, QThread, QTimer, pyqtSignal
 
-from ..sdk import ASICamera, ASIDriver, ASIError, CameraInfo, Ctrl, ImgType
 from ..camera_config import CameraControlSet, CameraSettings
-from ..capture import CaptureWorker
 from ..recorder import save_fits_cube, save_fits_individual, HAS_ASTROPY
+from ..vendors import create_vendors
+from .gating import RecordGate
 from .states import CameraState
-from .thermal import TecConfig, TecSettleMonitor
+from .thermal import TecSettleMonitor
 
 log = logging.getLogger("cmoscam.controller")
-
-VENDOR = "zwo"  # Phase 2 makes this a per-backend property
-
-_SDK_CANDIDATES = [
-    "ASICamera2.dll",
-    r"C:\Program Files\ASIStudio\ASICamera2.dll",
-    r"C:\Program Files (x86)\ASIStudio\ASICamera2.dll",
-    "/usr/lib/libASICamera2.so",
-    "/usr/local/lib/libASICamera2.so",
-]
 
 
 class CameraController(QObject):
@@ -73,11 +62,14 @@ class CameraController(QObject):
     def __init__(self, sdk_path=None, parent=None):
         super().__init__(parent)
 
-        self._driver = None
+        self._vendors = create_vendors()   # name -> Vendor instance
+        self._vendor = None                # vendor of the connected camera
+        self._cam_map = []                 # flat index -> (vendor, local_idx)
         self._camera = None
         self._worker = None
         self._worker_thread = None
         self._streaming = False
+        self._applied_exposure_s = None    # exposure last pushed to hardware
 
         self._control_set = None    # CameraControlSet
         self._settings = None       # CameraSettings
@@ -103,7 +95,7 @@ class CameraController(QObject):
         # Cooler state (canonical; hardware is set via set_cooler)
         self._cooler_on = False
         self._cooler_target = -10.0
-        self.tec_monitor = TecSettleMonitor(TecConfig())
+        self.tec_monitor = TecSettleMonitor()   # re-tuned per vendor at connect
 
         # Per-record header extras (from remote record cmd; cleared after)
         self._next_record_obstype = None
@@ -183,22 +175,31 @@ class CameraController(QObject):
 
     @property
     def sdk_loaded(self) -> bool:
-        return self._driver is not None
+        return any(v.loaded for v in self._vendors.values())
 
     def load_sdk(self, path=None) -> bool:
-        candidates = ([path] if path else []) + _SDK_CANDIDATES
-        for c in candidates:
-            if os.path.isfile(c):
-                try:
-                    self._driver = ASIDriver(c)
-                    self.status_message.emit(f"SDK loaded: {c}")
-                    return True
-                except Exception as e:
-                    self.status_message.emit(f"SDK load failed ({c}): {e}")
-        self.status_message.emit(
-            "SDK not found -- click Browse SDK to locate ASICamera2.dll/.so"
-        )
-        return False
+        """Load every vendor SDK that can be found.
+
+        `path` (the --sdk flag / Browse dialog) is offered to each vendor;
+        each ignores paths that aren't its library.
+        """
+        loaded = []
+        for v in self._vendors.values():
+            if v.loaded:
+                loaded.append(v.name)
+                continue
+            where = v.load(path)
+            if where:
+                loaded.append(v.name)
+                self.status_message.emit(f"{v.name} SDK loaded: {where}")
+        if not loaded:
+            self.status_message.emit(
+                "No camera SDK found -- Browse to ASICamera2.dll, or place "
+                "qhyccd.dll under sdk/"
+            )
+            return False
+        self.status_message.emit("SDKs loaded: " + ", ".join(loaded))
+        return True
 
     # =================================================================
     #  Discovery / connection
@@ -230,40 +231,59 @@ class CameraController(QObject):
         return self._worker.frame_queue if self._worker else None
 
     def list_cameras(self) -> list:
-        if not self._driver:
+        """Enumerate cameras across all loaded vendors (flat indices)."""
+        if not self.sdk_loaded:
             raise RuntimeError("SDK not loaded")
+        self._cam_map = []
         cams = []
-        for i in range(self._driver.get_num_cameras()):
-            info = CameraInfo.from_struct(self._driver.get_camera_property(i))
-            cams.append({"index": i, "name": info.name, "vendor": VENDOR})
+        for v in self._vendors.values():
+            if not v.loaded:
+                continue
+            for c in v.list_cameras():
+                idx = len(self._cam_map)
+                self._cam_map.append((v, c["index"]))
+                cams.append({
+                    "index": idx, "name": c["name"], "vendor": v.name,
+                })
         return cams
 
+    def capabilities(self) -> dict:
+        """Capability flags of the connected camera ({} if none)."""
+        if not self._camera:
+            return {}
+        return self._camera.capabilities()
+
     def connect_camera(self, index: int):
-        if not self._driver:
+        if not self.sdk_loaded:
             raise RuntimeError("SDK not loaded")
         if self._camera is not None:
             return
+        if not self._cam_map:
+            self.list_cameras()
+        if not 0 <= index < len(self._cam_map):
+            raise RuntimeError(
+                f"camera index {index} out of range "
+                f"({len(self._cam_map)} camera(s) found)"
+            )
+        vendor, local_idx = self._cam_map[index]
+
         self._recompute_state(transient=CameraState.INITIALIZING)
         try:
-            # Enumeration must precede GetCameraProperty (SDK requirement),
-            # so connect works even without a prior list_cameras() call.
-            n = self._driver.get_num_cameras()
-            if not 0 <= index < n:
-                raise RuntimeError(
-                    f"camera index {index} out of range ({n} camera(s) found)"
-                )
-            self._camera = ASICamera(self._driver, index)
+            self._camera = vendor.open(local_idx)
+            self._vendor = vendor
             cam = self._camera
 
             caps_dict = cam.get_caps_dict()
             self._control_set = CameraControlSet.from_caps_dict(
-                cam.info.name, caps_dict
+                cam.info.name, caps_dict,
+                default_overrides=vendor.profile.default_overrides,
             )
             self._settings = CameraSettings(self._control_set)
+            vendor.profile.post_connect(self._settings)
             log.info("\n%s", self._control_set.describe())
 
-            # Max out USB bandwidth for streaming
-            self._settings.set_if_present("BandWidth", 9999, clamp=True)
+            # Per-vendor TEC tuning
+            self.tec_monitor = TecSettleMonitor(vendor.profile.tec_config)
 
             # Full-frame ROI by default
             self.roi = {
@@ -273,30 +293,35 @@ class CameraController(QObject):
 
             self.apply_settings(silent=True)
 
-            self.tec_monitor.reset()
             self._cooler_on = False
-            if self._control_set.has_cooler():
+            caps = cam.capabilities()
+            if caps.get("has_cooler"):
                 spec = self._control_set.get("TargetTemp")
                 if spec:
                     self._cooler_target = spec.default_value
                 self._thermal_timer.start(2000)
 
-            flags = []
-            if self._control_set.has_cooler():
+            flags = [vendor.name]
+            if caps.get("has_cooler"):
                 flags.append("cooled")
-            if self._control_set.has_frame_rate_control():
-                flags.append("indep-fps")
+            if caps.get("has_gps"):
+                flags.append("gps")
             if self._control_set.has_offset():
                 flags.append("offset")
             self.status_message.emit(
                 f"Connected: {cam.info.name}  |  "
                 f"{cam.info.max_width}x{cam.info.max_height}  |  "
                 f"{cam.info.bit_depth}-bit  |  "
-                f"USB3={'yes' if cam.info.is_usb3 else 'no'}  |  "
                 + "  ".join(flags)
             )
         except Exception:
+            if self._camera is not None:
+                try:
+                    self._camera.close()
+                except Exception:
+                    pass
             self._camera = None
+            self._vendor = None
             self._control_set = None
             self._settings = None
             self._recompute_state()
@@ -310,11 +335,14 @@ class CameraController(QObject):
         if self._camera:
             self._camera.close()
             self._camera = None
+        self._vendor = None
         self._control_set = None
         self._settings = None
         self._cooler_on = False
         self._error_msg = None
         self._applied_roi = None
+        self._applied_exposure_s = None
+        self._last_temp = None
         self.tec_monitor.reset()
         self._recompute_state()
         self.connected_changed.emit(False)
@@ -355,6 +383,10 @@ class CameraController(QObject):
         def _do():
             try:
                 settings.apply_one(cam, name)
+                if name == "Exposure":
+                    val = settings.get("Exposure")
+                    if val:
+                        self._applied_exposure_s = val / 1e6
             except Exception as e:
                 log.debug("live-apply %s failed: %s", name, e)
 
@@ -430,28 +462,29 @@ class CameraController(QObject):
     def _apply_hw(self, silent=False):
         """The actual hardware push. Call only from the SDK-owning thread."""
         cam = self._camera
-        img_type = ImgType.RAW16 if self.img_type == "RAW16" else ImgType.RAW8
-        # Only touch the ROI when it actually changed: ASISetROIFormat
-        # mid-stream stalls the video pipeline for seconds (measured).
+        # Only touch the ROI when it actually changed: mid-stream ROI
+        # pushes stall the ASI video pipeline for seconds (measured).
         roi_key = (self.roi["x"], self.roi["y"], self.roi["w"], self.roi["h"],
                    self.img_type)
         if roi_key != self._applied_roi:
-            cam.set_roi(
-                self.roi["w"], self.roi["h"], 1, img_type,
-                self.roi["x"], self.roi["y"],
+            cam.apply_roi(
+                self.roi["x"], self.roi["y"], self.roi["w"], self.roi["h"],
+                self.img_type,
             )
             self._applied_roi = roi_key
         errors = self._settings.apply(cam)
+        exp = self._settings.get("Exposure")
+        if exp:
+            self._applied_exposure_s = exp / 1e6
 
         if not silent:
             if errors:
                 err_str = ", ".join(f"{n}: {e}" for n, e in errors)
                 self.status_message.emit(f"Settings errors: {err_str}")
             else:
-                w, h, _b, _t = cam.get_roi()
                 self.status_message.emit(
-                    f"Applied -- ROI={w}x{h}+({self.roi['x']},{self.roi['y']})  "
-                    f"{self.img_type}"
+                    f"Applied -- ROI={self.roi['w']}x{self.roi['h']}"
+                    f"+({self.roi['x']},{self.roi['y']})  {self.img_type}"
                 )
         return errors
 
@@ -488,13 +521,17 @@ class CameraController(QObject):
         if not cam or not cam.info.is_cooler:
             return False
         try:
-            self._last_temp = cam.temperature()
-            if cam.has_ctrl(Ctrl.COOLER_POWER_PERC):
-                self._last_power = float(
-                    cam.get_ctrl_value(Ctrl.COOLER_POWER_PERC)
-                )
-            return True
-        except ASIError:
+            t = cam.temperature()
+            if t == t:   # not NaN (QHY readout is bogus while PWM == 0)
+                self._last_temp = t
+            p = cam.cooler_power()
+            if p is not None:
+                self._last_power = float(p)
+            # QHY TEC regulation needs a periodic keep-alive even when
+            # nothing is streaming.
+            cam.thermal_keepalive()
+            return t == t
+        except Exception:
             return False
 
     def _poll_thermal(self):
@@ -552,7 +589,7 @@ class CameraController(QObject):
                 s.name: s.control_type
                 for s in self._control_set.readonly() if s.control_type >= 0
             }
-        self._worker = CaptureWorker(cam, exp_ms, readonly_ctrls)
+        self._worker = self._vendor.worker_class(cam, exp_ms, readonly_ctrls)
         self._worker_thread = QThread()
         self._worker.moveToThread(self._worker_thread)
 
@@ -650,16 +687,32 @@ class CameraController(QObject):
         worker = self._worker
         self._record_pending = True
 
+        overhead_hint = self._vendor.profile.cadence_overhead_s
+
         def _arm():
             if not self._record_pending:   # cancelled before arming
                 return
+            # Cadence estimate from the running stream, taken BEFORE the
+            # apply below may change the exposure.
+            med = worker.recent_median_delta()
+            prev_exp = self._applied_exposure_s
             try:
                 self._apply_hw(silent=True)
             except Exception:
                 log.exception("apply before record failed")
-            w, h, _bin, img_t = cam.get_roi()
-            dtype = np.uint16 if img_t == int(ImgType.RAW16) else np.uint8
-            worker.start_recording(n, w, h, dtype)
+            exp_s = (self._settings.get("Exposure") or 100_000) / 1e6
+            if med is not None and prev_exp is not None:
+                overhead = max(0.02, med - prev_exp)
+            else:
+                overhead = overhead_hint
+            gate = RecordGate(
+                t_arm=time.perf_counter(),
+                exposure_s=exp_s,
+                expected_cadence_s=exp_s + overhead,
+            )
+            w, h, _bin, _img = cam.get_roi()
+            dtype = cam.frame_dtype()
+            worker.start_recording(n, w, h, dtype, gate=gate)
             self._record_armed.emit(n)
 
         worker.run_async(_arm)
@@ -721,6 +774,13 @@ class CameraController(QObject):
                 meta["DETTEMP"] = (
                     self._last_temp, "[C] sensor temperature"
                 )
+            # Vendor-specific run cards (DATASEC, GPS flags, read mode...)
+            try:
+                for key, val, cmt in cam.run_header_cards(
+                        int(cube.shape[2]), int(cube.shape[1])):
+                    meta[key] = (val, cmt) if cmt else val
+            except Exception:
+                log.exception("run_header_cards failed")
 
         # Extras from the remote client, applied last so they win.
         for extra in (self._next_record_extras or []):
@@ -734,6 +794,11 @@ class CameraController(QObject):
 
     def _on_recording_done(self, cube, timestamps, elapsed):
         meta = self._build_record_metadata(cube, elapsed)
+        # Per-frame vendor metadata (e.g. QHY GPS seq/UTC), if the worker
+        # collected any during this record.
+        frame_meta = getattr(self._worker, "last_frame_meta", None)
+        if frame_meta and not any(frame_meta):
+            frame_meta = None
 
         directory = str(self.record_params["directory"]) or os.getcwd()
         basename = str(self.record_params["basename"]) or "capture"
@@ -762,11 +827,13 @@ class CameraController(QObject):
         if stack_mode:
             path = os.path.join(directory, f"{basename}.fits")
             save_fits_cube(path, cube, meta, _after_save,
-                           combine=combine, combine_only=combine_only)
+                           combine=combine, combine_only=combine_only,
+                           timestamps=timestamps, frame_meta=frame_meta)
         else:
             save_fits_individual(
                 directory, basename, cube, timestamps, meta, _after_save,
                 combine=combine, combine_only=combine_only,
+                frame_meta=frame_meta,
             )
 
     # =================================================================
@@ -780,9 +847,16 @@ class CameraController(QObject):
             "connected": cam is not None,
             "streaming": self._streaming,
             "camera": cam.info.name if cam else None,
-            "vendor": VENDOR if cam else None,
+            "vendor": self._vendor.name if self._vendor else None,
             "camera_state": self._state.name,
         }
+        gps = getattr(self._worker, "last_gps", None) if self._worker else None
+        if gps:
+            result["gps"] = {
+                "locked": gps.get("GPS_LOCK"),
+                "last_seq": gps.get("GPS_SEQ"),
+                "last_utc": gps.get("DATE-BEG"),
+            }
         if self._error_msg:
             result["error_message"] = self._error_msg
         if cam:
