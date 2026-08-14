@@ -569,16 +569,24 @@ class MainWindow(QMainWindow):
                 return
 
             self._last_raw_frame = frame
+
+            # Decimate for display: the rendered pixmap is ~1400 px wide,
+            # and full-res stretch+histogram on a 47 MP frame costs >2 s of
+            # GUI-thread time per frame (measured) — the GUI froze at the
+            # frame cadence. Subsampled processing is visually identical.
+            step = max(1, (max(frame.shape) + 1599) // 1600)
+            small = frame[::step, ::step] if step > 1 else frame
+
             stretch_name = self._stretch_combo.currentText()
             stretch_fn = STRETCH_FUNCS.get(stretch_name, STRETCH_FUNCS["99.5%"])
-            disp, z1, z2 = stretch_fn(frame)
-            self._display.set_frame(frame, disp)
+            disp, z1, z2 = stretch_fn(small)
+            self._display.set_frame(small, disp, coord_scale=step)
 
-            # Histogram at ~5 Hz (expensive on large frames)
+            # Histogram at ~5 Hz
             now = time.monotonic()
             if now - self._last_hist_time >= 0.2:
                 self._last_hist_time = now
-                self._histogram.update_data(frame, z1, z2)
+                self._histogram.update_data(small, z1, z2)
         finally:
             # Re-arm for next tick (fires AFTER this work completes)
             if self._c.streaming:

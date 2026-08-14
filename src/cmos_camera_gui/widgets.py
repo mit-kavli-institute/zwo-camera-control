@@ -182,17 +182,23 @@ class ImageDisplay(QLabel):
 
         self._raw_frame = None
         self._frame_shape = (1, 1)  # (H, W)
+        self._coord_scale = 1
 
-    def set_frame(self, raw_frame, display_8bit):
+    def set_frame(self, raw_frame, display_8bit, coord_scale=1):
         """
         Update the display.
 
         Parameters
         ----------
-        raw_frame : original (possibly 16-bit) frame for pixel readout
+        raw_frame : original (possibly 16-bit) frame for pixel readout;
+            may be a decimated view of the sensor frame
         display_8bit : uint8 stretched frame for rendering
+        coord_scale : int
+            Decimation step of raw_frame relative to the sensor frame;
+            hover coordinates are reported in sensor pixels.
         """
         self._raw_frame = raw_frame
+        self._coord_scale = int(coord_scale)
         h, w = display_8bit.shape[:2]
         self._frame_shape = (h, w)
 
@@ -234,7 +240,8 @@ class ImageDisplay(QLabel):
         if coords is not None and self._raw_frame is not None:
             px, py = coords
             val = int(self._raw_frame[py, px])
-            self.pixel_info.emit(px, py, val)
+            s = self._coord_scale
+            self.pixel_info.emit(px * s, py * s, val)
         else:
             self.pixel_left.emit()
         super().mouseMoveEvent(event)
