@@ -613,9 +613,9 @@ class CameraController(QObject):
         if mode not in ("stack", "individual"):
             raise ValueError(f"mode must be stack|individual, got {mode!r}")
         combine = self.record_params["combine"]
-        if combine not in ("none", "mean", "median"):
+        if combine not in ("none", "mean", "median", "sum"):
             raise ValueError(
-                f"combine must be none|mean|median, got {combine!r}"
+                f"combine must be none|mean|median|sum, got {combine!r}"
             )
         self.record_params["combine_only"] = bool(
             self.record_params["combine_only"]

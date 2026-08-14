@@ -647,7 +647,9 @@ class MainWindow(QMainWindow):
             self._mode_stack_rb.setChecked(True)
         else:
             self._mode_indiv_rb.setChecked(True)
-        idx = {"none": 0, "mean": 1, "median": 2}.get(str(p["combine"]), 0)
+        idx = {"none": 0, "mean": 1, "median": 2, "sum": 3}.get(
+            str(p["combine"]), 0
+        )
         self._combine_combo.setCurrentIndex(idx)
         self._combine_only_cb.setChecked(bool(p["combine_only"]))
 
@@ -901,11 +903,12 @@ class MainWindow(QMainWindow):
         comb_lbl.setStyleSheet("color: #888; font: 9pt 'Courier New';")
         comb_row.addWidget(comb_lbl)
         self._combine_combo = QComboBox()
-        for name in ("None", "Mean", "Median"):
+        for name in ("None", "Mean", "Median", "Sum"):
             self._combine_combo.addItem(name)
         self._combine_combo.setToolTip(
             "Additionally save a combined float32 frame "
-            "({basename}_mean.fits / _median.fits)"
+            "({basename}_mean/_median/_sum.fits). Sum writes net "
+            "integration as EXPTIME (per-frame moves to EXPFRAME)."
         )
         comb_row.addWidget(self._combine_combo, stretch=1)
         self._combine_only_cb = QCheckBox("only")

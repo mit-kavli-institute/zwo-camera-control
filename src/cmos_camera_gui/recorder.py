@@ -36,18 +36,39 @@ def _scalar(v) -> float:
 
 
 def _combined_hdu(cube, metadata, method):
-    """Combine a (N, H, W) cube into one float32 frame (mean|median)."""
+    """Combine a (N, H, W) cube into one float32 frame (mean|median|sum)."""
+    n = int(cube.shape[0])
     if method == "median":
         comb = np.median(cube, axis=0).astype(np.float32)
+    elif method == "sum":
+        comb = cube.sum(axis=0, dtype=np.float64).astype(np.float32)
     else:
         comb = cube.mean(axis=0, dtype=np.float64).astype(np.float32)
     hdr = pyfits.Header()
     for k, v in metadata.items():
         hdr[k] = v
     hdr["BUNIT"] = "ADU"
-    hdr["NCOMBINE"] = (int(cube.shape[0]), "number of frames combined")
-    hdr["COMBINED"] = (method, "combine method (mean|median)")
+    hdr["NCOMBINE"] = (n, "number of frames combined")
+    hdr["COMBINED"] = (method, "combine method (mean|median|sum)")
     hdr["COMMENT"] = "CMOS Control GUI combined frame"
+
+    if method == "sum":
+        # A summed stack reads like one long exposure: EXPTIME becomes the
+        # net integration; the per-frame exposure moves to EXPFRAME.
+        exp_frame = metadata.get("EXPTIME")
+        if exp_frame is not None:
+            exp_frame_ms = _scalar(exp_frame)
+            hdr["EXPFRAME"] = (exp_frame_ms, "[ms] per-frame exposure")
+            hdr["EXPTIME"] = (
+                exp_frame_ms * n,
+                f"[ms] net integration (sum of {n} frames)",
+            )
+        hdr["COMMENT"] = (
+            f"Summed stack: bias/dark pedestal is {n}x a single frame;"
+        )
+        hdr["COMMENT"] = (
+            f"read noise is sqrt({n})x a single frame of equal EXPTIME."
+        )
     return pyfits.PrimaryHDU(data=comb, header=hdr)
 
 
@@ -74,7 +95,7 @@ def save_fits_cube(path, cube, metadata, on_done, combine="none",
         FITS header keywords (camera controls, ROI, elapsed, fps, ...).
     on_done : callable(str)
         Callback with status message, called on the Qt GUI thread.
-    combine : {"none", "mean", "median"}
+    combine : {"none", "mean", "median", "sum"}
         Additionally save a combined float32 frame as
         ``{path minus ext}_{combine}.fits`` (NCOMBINE/COMBINED headers).
     combine_only : bool

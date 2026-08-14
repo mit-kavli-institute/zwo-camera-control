@@ -206,10 +206,12 @@ class CameraClient(AbstractContextManager):
               - iterable of ``(key, value)`` / ``(key, value, comment)``
               - iterable of ``astropy.io.fits.Card`` objects
             Applied *after* the auto-filled metadata, so these win on collision.
-        combine : {"none", "mean", "median"}
+        combine : {"none", "mean", "median", "sum"}
             Additionally save a combined float32 frame
-            (``{basename}_mean.fits`` / ``_median.fits``, with
-            NCOMBINE/COMBINED headers).
+            (``{basename}_mean.fits`` / ``_median.fits`` / ``_sum.fits``,
+            with NCOMBINE/COMBINED headers). For "sum", EXPTIME becomes
+            the net integration (n_frames x per-frame exposure) and the
+            per-frame exposure is kept as EXPFRAME.
         combine_only : bool
             With combine set: save only the combined frame, skip the full
             stack/individual files.
@@ -227,9 +229,9 @@ class CameraClient(AbstractContextManager):
         """
         if mode not in ("stack", "individual"):
             raise ValueError(f"mode must be 'stack' or 'individual', got {mode!r}")
-        if combine not in ("none", "mean", "median"):
+        if combine not in ("none", "mean", "median", "sum"):
             raise ValueError(
-                f"combine must be 'none', 'mean' or 'median', got {combine!r}"
+                f"combine must be 'none', 'mean', 'median' or 'sum', got {combine!r}"
             )
 
         cmd: Dict[str, Any] = {"cmd": "record", "n_frames": int(n_frames), "mode": mode}
