@@ -17,6 +17,9 @@ dependencies = [
 ]
 
 
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
 [project.scripts]
 cmos-camera-gui = "cmos_camera_gui.__main__:main"
 
