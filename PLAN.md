@@ -282,10 +282,18 @@ required-minimum-set validation still open (missing: DATE-OBS, CAMID,
 XBINNING, SWCREATE, TIMESYS/TIMESRC). Phase 4 (QHY42PRO) hardware-
 validated end to end: stream, gated grabs with consecutive GPS seqs,
 TEC (with measured CURPWM-readback quirk handled), high-speed idle mode;
-grab floor T+~65-100 ms confirmed in both idle modes. Open: GPS-locked
-validation (needs antenna), QHY ROI/binning untested, committed pytest
-suite (tests currently live in session scratchpad), README/examples
-refresh, merge to main.
+grab floor T+~65-100 ms confirmed in both idle modes. Closeout status (2026-08-15): committed pytest suite (35 tests,
+`tests/`), required-header set + save-time validation, and docs refresh
+(README, docs/HardwareFieldNotes.md, examples/qhy_summer.ipynb) are DONE.
+WSP/SUMMER compliance layer done and acceptance-tested (§10);
+docs/WspSummerDaemonHandoff.md hands off the daemon side.
+
+**Deferred, pick up down the line:** (a) GPS-locked validation — needs
+the antenna: confirm locked=true, real UTC in DATE-BEG, seq/timing
+across a grab; (b) QHY ROI/binning hardware test — implemented (applied
+at stream start) but never exercised on hardware; full frame is the
+validated path. **Not merged to main yet** — pending Nate's final
+hardware sign-off.
 
 | Phase | Work | Risk / validation |
 |---|---|---|
