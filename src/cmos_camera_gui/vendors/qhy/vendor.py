@@ -316,9 +316,14 @@ class QhyCamera:
     def has_ctrl(self, control_type: int) -> bool:
         return self.sdk.is_control_available(control_type, self.handle)
 
+    @property
+    def serial(self):
+        return self.camera_id   # e.g. "QHY42PRO-d3d9c94da1c7f9bf7"
+
     def run_header_cards(self, w, h) -> list:
         cards = [
             ("CAMVENDR", "qhy", "camera vendor"),
+            ("CAMID", self.camera_id, "camera id/serial"),
             ("READMODE", self._read_mode, "QHYCCD sensor read mode"),
             ("SDKVER", self._sdk_version, "QHYCCD SDK version"),
         ]

@@ -99,6 +99,10 @@ class _CameraInfo(ctypes.Structure):
     ]
 
 
+class _SerialNumber(ctypes.Structure):
+    _fields_ = [("id", ctypes.c_ubyte * 8)]
+
+
 class _ControlCaps(ctypes.Structure):
     _fields_ = [
         ("Name", ctypes.c_char * 64),
@@ -272,6 +276,12 @@ class ASIDriver:
             ctypes.c_int, ctypes.POINTER(ctypes.c_int)
         ]
 
+        if hasattr(L, "ASIGetSerialNumber"):
+            L.ASIGetSerialNumber.restype = ctypes.c_int
+            L.ASIGetSerialNumber.argtypes = [
+                ctypes.c_int, ctypes.POINTER(_SerialNumber)
+            ]
+
     @staticmethod
     def _chk(code: int, func: str = ""):
         if code != ASI_SUCCESS:
@@ -388,6 +398,15 @@ class ASIDriver:
             "GetDroppedFrames",
         )
         return n.value
+
+    def get_serial_number(self, cam_id: int):
+        """Camera serial as a hex string, or None if unsupported."""
+        if not hasattr(self._lib, "ASIGetSerialNumber"):
+            return None
+        sn = _SerialNumber()
+        if self._lib.ASIGetSerialNumber(cam_id, ctypes.byref(sn)) != ASI_SUCCESS:
+            return None
+        return "".join(f"{b:02X}" for b in sn.id)
 
 
 # -- ASICamera (high-level) ----------------------------------------------------

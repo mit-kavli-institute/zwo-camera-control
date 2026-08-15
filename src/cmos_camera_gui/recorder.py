@@ -9,10 +9,38 @@ Both run I/O on a daemon thread so the GUI never blocks, and use a QObject
 signal bridge to deliver the completion callback on the GUI thread.
 """
 
+import logging
 import os
 import threading
 
 import numpy as np
+
+log = logging.getLogger("cmoscam.recorder")
+
+# Required minimum FITS header set (PLAN.md §4). Policy: a missing key is
+# filled with 'UNKNOWN' and logged loudly -- data is never lost to a
+# header-plumbing bug -- and the committed tests assert that normal
+# operation produces every key for real.
+REQUIRED_HEADER_KEYS = (
+    "INSTRUME", "DETECTOR", "CAMID", "CAMVENDR",
+    "NFRAMES", "EXPTIME", "GAIN", "DEPTH",
+    "DATE-OBS", "TIMESYS", "TIMESRC",
+    "ROI_W", "ROI_H", "XBINNING", "YBINNING",
+    "DATASEC", "SWCREATE",
+)
+
+
+def _validate_required(metadata: dict) -> dict:
+    missing = [k for k in REQUIRED_HEADER_KEYS if k not in metadata]
+    if missing:
+        log.warning(
+            "FITS header missing required keys (filled with UNKNOWN): %s",
+            ", ".join(missing),
+        )
+        metadata = dict(metadata)
+        for k in missing:
+            metadata[k] = "UNKNOWN"
+    return metadata
 
 from PyQt5.QtCore import QObject, pyqtSignal
 
@@ -183,13 +211,14 @@ def save_fits_cube(path, cube, metadata, on_done, combine="none",
 
     def _worker():
         try:
-            elapsed = _scalar(metadata.get("ELAPSED", 0))
+            meta = _validate_required(metadata)
+            elapsed = _scalar(meta.get("ELAPSED", 0))
             fps = cube.shape[0] / elapsed if elapsed > 0 else 0
             parts = []
 
             if not (combine != "none" and combine_only):
                 hdr = pyfits.Header()
-                for k, v in metadata.items():
+                for k, v in meta.items():
                     hdr[k] = v
                 hdr["BUNIT"] = "ADU"
                 # FITS headers must be printable ASCII -- no unicode dashes
@@ -223,7 +252,7 @@ def save_fits_cube(path, cube, metadata, on_done, combine="none",
 
             if combine != "none":
                 cpath = _combined_path(path, combine)
-                hdu = _combined_hdu(cube, metadata, combine)
+                hdu = _combined_hdu(cube, meta, combine)
                 hdu.writeto(cpath, overwrite=True, output_verify='silentfix')
                 parts.append(f"{combine} of {cube.shape[0]} -> {cpath}")
 
@@ -261,6 +290,7 @@ def save_fits_individual(directory, basename, cube, timestamps, metadata,
 
     def _worker():
         try:
+            meta = _validate_required(metadata)
             os.makedirs(directory, exist_ok=True)
             ts_arr = np.array(timestamps, dtype=np.float64)
             dt_arr = np.diff(ts_arr, prepend=0.0)
@@ -272,7 +302,7 @@ def save_fits_individual(directory, basename, cube, timestamps, metadata,
             skip_frames = combine != "none" and combine_only
             for i in range(n if not skip_frames else 0):
                 hdr = pyfits.Header()
-                for k, v in metadata.items():
+                for k, v in meta.items():
                     hdr[k] = v
                 hdr["FRAME_ID"] = (int(i), "frame index within the series")
                 hdr["TIMESTMP"] = (float(ts_arr[i]), "[s] since recording start")
@@ -292,7 +322,7 @@ def save_fits_individual(directory, basename, cube, timestamps, metadata,
                 total_bytes += cube[i].nbytes
 
             mb = total_bytes / 1e6
-            elapsed = _scalar(metadata.get("ELAPSED", 0))
+            elapsed = _scalar(meta.get("ELAPSED", 0))
             fps = n / elapsed if elapsed > 0 else 0
             parts = []
             if not skip_frames:
@@ -304,7 +334,7 @@ def save_fits_individual(directory, basename, cube, timestamps, metadata,
                 cpath = os.path.join(
                     directory, f"{basename}_{combine}.fits"
                 )
-                hdu = _combined_hdu(cube, metadata, combine)
+                hdu = _combined_hdu(cube, meta, combine)
                 hdu.writeto(cpath, overwrite=True, output_verify="silentfix")
                 parts.append(f"{combine} of {n} -> {cpath}")
             msg = "Saved " + "; ".join(parts)

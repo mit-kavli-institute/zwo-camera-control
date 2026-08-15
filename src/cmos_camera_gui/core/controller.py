@@ -27,6 +27,7 @@ from datetime import datetime
 
 from PyQt5.QtCore import QObject, QThread, QTimer, pyqtSignal
 
+from .. import __version__
 from ..camera_config import CameraControlSet, CameraSettings
 from ..recorder import save_fits_cube, save_fits_individual, HAS_ASTROPY
 from ..vendors import create_vendors
@@ -862,8 +863,15 @@ class CameraController(QObject):
             "DEPTH": self.img_type,
         }
 
+        meta["XBINNING"] = (1, "binning factor, X")
+        meta["YBINNING"] = (1, "binning factor, Y")
+        meta["SWCREATE"] = (f"cmos-camera-gui {__version__}",
+                            "software that created this file")
+
         # DATE-OBS: GPS time of first kept frame when locked, else host
-        # UTC of the record arm; TIMESRC records which.
+        # UTC of the record arm; TIMESRC records which. TIMESYS is UTC
+        # either way.
+        meta["TIMESYS"] = ("UTC", "time system")
         frame_meta = getattr(self._worker, "last_frame_meta", None) or []
         gps0 = frame_meta[0] if frame_meta and frame_meta[0] else {}
         if gps0.get("GPS_LOCK") and gps0.get("DATE-BEG"):
@@ -892,6 +900,10 @@ class CameraController(QObject):
                 meta["EXPTIME"] = (
                     snap["Exposure"] / 1000.0, "[ms] exposure time"
                 )
+        if "EXPTIME" not in meta and self._requested_exposure_s is not None:
+            meta["EXPTIME"] = (
+                self._requested_exposure_s * 1000.0, "[ms] exposure time"
+            )
         if cam:
             # From the cube itself -- a get_roi() SDK call here would block
             # behind the still-streaming capture thread.

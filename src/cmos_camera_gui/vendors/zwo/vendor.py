@@ -69,11 +69,22 @@ class ZwoCamera(ASICamera):
     def thermal_keepalive(self):
         pass  # ASI TEC regulates on its own once set
 
+    @property
+    def serial(self):
+        try:
+            return self.driver.get_serial_number(self.cam_id)
+        except Exception:
+            return None
+
     def run_header_cards(self, w, h) -> list:
-        return [
+        cards = [
             ("CAMVENDR", "zwo", "camera vendor"),
             ("DATASEC", f"[1:{w},1:{h}]", "image section (all pixels)"),
         ]
+        sn = self.serial
+        if sn:
+            cards.append(("CAMID", sn, "camera serial number"))
+        return cards
 
 
 class ZwoVendor:
